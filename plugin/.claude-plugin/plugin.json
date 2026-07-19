@@ -1,0 +1,14 @@
+{
+  "name": "forksan",
+  "displayName": "forksan",
+  "version": "0.1.0",
+  "description": "Forks for Claude Code: run throwaway forked-context prompts at lifecycle moments (idle, compact, session start/end, context thresholds) and inject their reports back into your session.",
+  "author": {
+    "name": "TheUnderdev",
+    "url": "https://github.com/TheUnderdev"
+  },
+  "homepage": "https://github.com/TheUnderdev/forksan",
+  "repository": "https://github.com/TheUnderdev/forksan",
+  "license": "MIT",
+  "keywords": ["forks", "background", "automation", "lifecycle", "hooks"]
+}

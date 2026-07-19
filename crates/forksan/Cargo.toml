@@ -1,0 +1,23 @@
+[package]
+name = "forksan"
+description = "forksan CLI: Claude Code hook entrypoint and daemon control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "forksan"
+path = "src/main.rs"
+
+[dependencies]
+forksan-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

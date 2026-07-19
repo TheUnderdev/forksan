@@ -1,0 +1,93 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches workspace + plugin version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          WORKSPACE=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          PLUGIN=$(python3 -c "import json;print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
+          echo "tag=$TAG workspace=$WORKSPACE plugin=$PLUGIN"
+          test "$TAG" = "$WORKSPACE"
+          test "$TAG" = "$PLUGIN"
+
+  build:
+    needs: check-version
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }} -p forksan -p forksan-daemon
+      - name: package
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          ASSET="forksan-v$VER-${{ matrix.target }}"
+          mkdir -p "dist/bin"
+          cp "target/${{ matrix.target }}/release/forksan" \
+             "target/${{ matrix.target }}/release/forksan-daemon" dist/bin/
+          strip dist/bin/forksan dist/bin/forksan-daemon 2>/dev/null || true
+          tar -czf "$ASSET.tar.gz" -C dist bin
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          else
+            shasum -a 256 "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: forksan-v*-${{ matrix.target }}.tar.gz*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: assets
+      - name: all eight assets present
+        run: |
+          COUNT=$(ls assets | wc -l)
+          echo "assets: $(ls assets)"
+          test "$COUNT" -eq 8
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --title "forksan $GITHUB_REF_NAME" \
+            --generate-notes

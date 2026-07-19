@@ -1,0 +1,14 @@
+{
+  "name": "forksan",
+  "owner": {
+    "name": "TheUnderdev",
+    "url": "https://github.com/TheUnderdev"
+  },
+  "plugins": [
+    {
+      "name": "forksan",
+      "source": "./plugin",
+      "description": "Forks for Claude Code: throwaway forked-context runs at lifecycle moments, reports injected back into your session."
+    }
+  ]
+}
