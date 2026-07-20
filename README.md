@@ -96,7 +96,10 @@ at most one dependency may use it.
 Runs of the same fork never overlap by default: if a moment fires while a previous run of that
 fork is still going (say a 4-minute idle fork that takes ten minutes), the new fire waits for
 it to finish, and any further fires arriving in the meantime are dropped — one is already
-queued, and fork bodies are idempotent. Set `overlap: true` to allow concurrent runs.
+queued, and fork bodies are idempotent. The waiting run also gets continuity: when the
+previous run's report hasn't reached the parent conversation yet, it is quoted into the new
+run's prompt as a `<previous_run>` block, so consecutive runs build on each other instead of
+repeating work. Set `overlap: true` to allow concurrent runs (no continuity block).
 
 ## How it works
 

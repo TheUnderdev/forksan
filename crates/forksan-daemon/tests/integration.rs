@@ -607,7 +607,21 @@ fn same_fork_runs_never_overlap_and_extra_fires_coalesce() {
     assert_eq!(max_in_flight, 1, "runs of the same fork overlapped");
     // Give a moment for any (wrong) third run to appear.
     std::thread::sleep(Duration::from_millis(700));
-    assert_eq!(h.stub_prompts().len(), 2, "coalesced fire still ran");
+    let prompts = h.stub_prompts();
+    assert_eq!(prompts.len(), 2, "coalesced fire still ran");
+
+    // Gated continuity: the waiting run's prompt carries the first run's
+    // report (it was never delivered to the parent in between).
+    let with_previous: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.contains("<previous_run fork=\"serial\">"))
+        .collect();
+    assert_eq!(
+        with_previous.len(),
+        1,
+        "exactly the second run sees the first's report"
+    );
+    assert!(with_previous[0].contains("stub report"));
 }
 
 #[test]

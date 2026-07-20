@@ -165,6 +165,18 @@ pub async fn run_one_fork(
         .map(|p| (p.name.clone(), p.reply.clone()))
         .collect();
 
+    // Gated continuity: surface the last run's report when the parent
+    // conversation we're forking hasn't received it yet.
+    let previous_report = if sel.def.overlap {
+        None
+    } else {
+        let store = daemon.store.lock().unwrap();
+        store
+            .latest_unseen_response(project_root, &sel.name, session_id)
+            .ok()
+            .flatten()
+    };
+
     let prompt = build_fork_prompt(
         &sel.name,
         &sel.path.to_string_lossy(),
@@ -172,6 +184,7 @@ pub async fn run_one_fork(
         &sel.trigger,
         sel.def.delivery,
         &piped,
+        previous_report.as_deref(),
     );
 
     let mut cmd = tokio::process::Command::new(&cfg.claude_bin);
