@@ -20,6 +20,8 @@ INPUT=$(cat)
 N=$(date +%s%N)-$$
 mkdir -p "$STUB_DIR"
 printf '%s' "$INPUT" > "$STUB_DIR/prompt-$N.txt"
+printf '%s\n' "$@" > "$STUB_DIR/args-$N.txt"
+printf 'session_id=%s\nfork_name=%s\ntrigger=%s\nproject_root=%s\n' "$FORKSAN_SESSION_ID" "$FORKSAN_FORK_NAME" "$FORKSAN_TRIGGER" "$FORKSAN_PROJECT_ROOT" > "$STUB_DIR/env-$N.txt"
 : > "$STUB_DIR/start-$N"
 case "$INPUT" in
   *STUB_SLOW*) sleep 2 ;;
@@ -33,6 +35,13 @@ case "$INPUT" in
     printf '{"result":"stub report %s","session_id":"stub-%s","total_cost_usd":0.01,"is_error":false}\n' "$N" "$N" ;;
 esac
 "#;
+
+/// One captured fork subprocess invocation.
+struct Invocation {
+    prompt: String,
+    args: Vec<String>,
+    env: String,
+}
 
 struct Harness {
     _tmp: tempfile::TempDir,
@@ -192,6 +201,33 @@ impl Harness {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Every fork invocation the stub captured, correlating the stdin prompt,
+    /// the argv, and the FORKSAN_* env by their shared filename suffix.
+    fn invocations(&self) -> Vec<Invocation> {
+        let mut out = Vec::new();
+        if let Ok(read) = std::fs::read_dir(&self.stub_dir) {
+            for entry in read.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                let Some(n) = fname
+                    .strip_prefix("prompt-")
+                    .and_then(|s| s.strip_suffix(".txt"))
+                else {
+                    continue;
+                };
+                let prompt = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                let args = std::fs::read_to_string(self.stub_dir.join(format!("args-{n}.txt")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(String::from)
+                    .collect();
+                let env = std::fs::read_to_string(self.stub_dir.join(format!("env-{n}.txt")))
+                    .unwrap_or_default();
+                out.push(Invocation { prompt, args, env });
+            }
+        }
+        out
     }
 
     fn stub_prompts(&self) -> Vec<String> {
@@ -443,6 +479,114 @@ fn tag_throttle_suppresses_group_but_other_tag_runs() {
         h.stub_prompts().iter().all(|p| !p.contains("B WORK")),
         "same-tag fork ran despite the tag throttle"
     );
+}
+
+#[test]
+fn fork_permission_flags_and_session_env_passed() {
+    let mut h = Harness::new("1h");
+    h.write_fork(
+        "a.md",
+        "---\nrun_on: [session_start]\nallowed_tools: [Write, 'Bash(git add:*)']\npermission_mode: acceptEdits\n---\nPERM WORK",
+    );
+    h.write_fork("b.md", "---\nrun_on: [session_start]\n---\nPLAIN WORK");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // Wait until both forks have been invoked.
+    let start = Instant::now();
+    let invs = loop {
+        let invs = h.invocations();
+        if invs.iter().any(|i| i.prompt.contains("PERM WORK"))
+            && invs.iter().any(|i| i.prompt.contains("PLAIN WORK"))
+        {
+            break invs;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "forks never ran: {:?}",
+            invs.iter().map(|i| &i.prompt).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // The permissioned fork carries both flags and every allowed_tools entry.
+    let perm = invs
+        .iter()
+        .find(|i| i.prompt.contains("PERM WORK"))
+        .unwrap();
+    assert!(perm.args.iter().any(|a| a == "--allowedTools"));
+    assert!(perm.args.iter().any(|a| a == "Write"));
+    assert!(perm.args.iter().any(|a| a == "Bash(git add:*)"));
+    assert!(perm.args.iter().any(|a| a == "--permission-mode"));
+    assert!(perm.args.iter().any(|a| a == "acceptEdits"));
+
+    // The plain fork gets neither permission flag.
+    let plain = invs
+        .iter()
+        .find(|i| i.prompt.contains("PLAIN WORK"))
+        .unwrap();
+    assert!(!plain.args.iter().any(|a| a == "--allowedTools"));
+    assert!(!plain.args.iter().any(|a| a == "--permission-mode"));
+
+    // Both invocations receive the parent session identity in the env.
+    assert!(perm.env.contains("session_id=s1"));
+    assert!(perm.env.contains("fork_name=a"));
+    assert!(perm.env.contains("trigger=session_start"));
+    assert!(perm
+        .env
+        .contains(&format!("project_root={}", h.project.display())));
+    assert!(plain.env.contains("fork_name=b"));
+    assert!(plain.env.contains("session_id=s1"));
+}
+
+#[test]
+fn config_permission_mode_applies_and_fork_overrides() {
+    let mut h = Harness::new("1h");
+    h.append_config("permission_mode = \"bypassPermissions\"");
+    h.write_fork(
+        "over.md",
+        "---\nrun_on: [session_start]\npermission_mode: acceptEdits\n---\nOVERRIDE WORK",
+    );
+    h.write_fork(
+        "inherit.md",
+        "---\nrun_on: [session_start]\n---\nINHERIT WORK",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    let start = Instant::now();
+    let invs = loop {
+        let invs = h.invocations();
+        if invs.iter().any(|i| i.prompt.contains("OVERRIDE WORK"))
+            && invs.iter().any(|i| i.prompt.contains("INHERIT WORK"))
+        {
+            break invs;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "forks never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // The fork's own mode wins over the config default.
+    let over = invs
+        .iter()
+        .find(|i| i.prompt.contains("OVERRIDE WORK"))
+        .unwrap();
+    let mode_after = |i: &Invocation| -> Option<String> {
+        i.args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .and_then(|p| i.args.get(p + 1).cloned())
+    };
+    assert_eq!(mode_after(over).as_deref(), Some("acceptEdits"));
+
+    // The fork without its own mode inherits the config default.
+    let inherit = invs
+        .iter()
+        .find(|i| i.prompt.contains("INHERIT WORK"))
+        .unwrap();
+    assert_eq!(mode_after(inherit).as_deref(), Some("bypassPermissions"));
 }
 
 #[test]

@@ -40,6 +40,10 @@ pub struct Config {
     /// Per-tag shared throttle (seconds): a minimum gap between runs of any
     /// fork carrying that tag, across the project.
     pub tag_throttles: BTreeMap<String, u64>,
+    /// Default `--permission-mode` for fork subprocesses (`default`,
+    /// `acceptEdits`, or `bypassPermissions`); a fork's own `permission_mode`
+    /// overrides it. `None` = no flag.
+    pub permission_mode: Option<String>,
 }
 
 impl Default for Config {
@@ -58,6 +62,7 @@ impl Default for Config {
             enable_tags: None,
             disable_tags: None,
             tag_throttles: BTreeMap::new(),
+            permission_mode: None,
         }
     }
 }
@@ -89,6 +94,7 @@ struct RawConfig {
     disable_tags: Option<Vec<String>>,
     #[serde(default)]
     tag_throttles: BTreeMap<String, toml::Value>,
+    permission_mode: Option<String>,
 }
 
 /// Keys ignored at project level (global-only concerns).
@@ -159,6 +165,15 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
         let key = format!("tag_throttles.{tag}");
         if let Some(secs) = parse_toml_duration(&v, &key, warnings) {
             cfg.tag_throttles.insert(tag, secs);
+        }
+    }
+    if let Some(m) = raw.permission_mode {
+        match m.trim() {
+            "" => {}
+            "default" | "acceptEdits" | "bypassPermissions" => {
+                cfg.permission_mode = Some(m.trim().to_string());
+            }
+            other => warnings.push(format!("unknown permission_mode '{other}', ignoring")),
         }
     }
 }
@@ -388,6 +403,42 @@ mod tests {
         assert_eq!(cfg.tag_throttles.get("review"), Some(&1800));
         assert_eq!(cfg.tag_throttles.get("docs"), Some(&600));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn permission_mode_layers_and_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "permission_mode = \"acceptEdits\"\n",
+        )
+        .unwrap();
+        // Project overrides with a valid mode.
+        fs::write(
+            proj.join(".forksan/config.toml"),
+            "permission_mode = \"bypassPermissions\"\n",
+        )
+        .unwrap();
+        let (cfg, _) = load_config(Some(&proj), Some(&home));
+        assert_eq!(cfg.permission_mode.as_deref(), Some("bypassPermissions"));
+
+        // Home-only when the project sets nothing.
+        let (cfg, _) = load_config(None, Some(&home));
+        assert_eq!(cfg.permission_mode.as_deref(), Some("acceptEdits"));
+
+        // An unknown value warns and leaves it unset.
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "permission_mode = \"pigeon\"\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(&home));
+        assert_eq!(cfg.permission_mode, None);
+        assert!(warnings.iter().any(|w| w.contains("permission_mode")));
     }
 
     #[test]

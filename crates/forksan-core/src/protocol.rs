@@ -220,6 +220,10 @@ pub struct ForkInfo {
     pub model: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     pub warnings: Vec<String>,
 }
 

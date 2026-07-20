@@ -69,6 +69,8 @@ open questions, and next steps. Keep it under 200 lines.
 | `overlap` | `true` to allow two runs of this fork at once | `false` |
 | `model` | model override for the fork run | session default |
 | `tags` | labels for the enable/disable filter: `ci`, `[ci, review]` | — |
+| `allowed_tools` | permission rules granted to the fork: `Write`, `[Write, "Bash(git add:*)"]` | — (read-only) |
+| `permission_mode` | `default` \| `acceptEdits` \| `bypassPermissions` | config, else none |
 
 Moments for `run_on`:
 
@@ -100,6 +102,36 @@ simply cancelled. The fork fires again at its next moment — the next idle time
 around after you've prompted again, which is exactly when the previous run's report gets
 injected into your session — so the next run inherits a parent context that already contains
 the previous result. Set `overlap: true` to allow concurrent runs.
+
+### Fork permissions
+
+A fork runs headless (`claude -p`) with isolated settings, so it **cannot answer permission
+prompts** — by default it can only use read-only tools, and anything needing Write, Edit, or
+Bash is denied. Grant what a fork needs up front:
+
+- `allowed_tools` lists [Claude Code permission rules](https://docs.claude.com/en/docs/claude-code/iam#permission-rules),
+  each passed verbatim to `--allowedTools`. Scope them tightly — prefer `Bash(git add:*)`,
+  `Write`, `Edit` over blanket `Bash`. A single rule may contain commas, so entries are never
+  comma-split (use a list for multiple rules).
+- `permission_mode` maps to `--permission-mode`: `acceptEdits` auto-accepts file edits,
+  `bypassPermissions` skips all checks (the blunt instrument — reserve it for trusted fork
+  bodies), `default` is the normal gate. `plan` is rejected (a headless fork can't act on a
+  plan). The fork's own `permission_mode` wins; otherwise the config default (below) applies;
+  otherwise no flag. `allowed_tools` composes with whichever mode is in effect.
+
+These two keys only affect the forksan runner — other tools consuming the fork format may
+ignore them.
+
+### Fork environment
+
+Every fork subprocess gets the parent session's identity in its environment, so a fork can
+key per-session state on disk deterministically (the cwd alone is not unique — several
+sessions run in one directory):
+
+- `FORKSAN_SESSION_ID` — the parent session id the fork was spawned for
+- `FORKSAN_FORK_NAME` — this fork's name
+- `FORKSAN_TRIGGER` — the trigger label (e.g. `idle:240`, `manual_stop`, `manual`)
+- `FORKSAN_PROJECT_ROOT` — the session's project root
 
 ## How it works
 
@@ -148,10 +180,16 @@ report_ttl = "7d"              # drop undelivered reports after this
 poll_budget_chars = 24000      # max report chars injected per turn
 enable_tags = ["ci"]           # default tag whitelist (see below)
 disable_tags = ["noisy"]       # default tag blocklist (see below)
+permission_mode = "acceptEdits" # default fork --permission-mode; a fork's own key wins
 
 [models]                       # per-model context windows
 "some-model-id" = 500000
 ```
+
+`permission_mode` sets the default `--permission-mode` for every fork run
+(`default` | `acceptEdits` | `bypassPermissions`; unknown values warn and are ignored). A
+fork's own `permission_mode` frontmatter overrides it; with neither set, no flag is passed.
+See [Fork permissions](#fork-permissions) for how it composes with `allowed_tools`.
 
 ### Tag filtering
 

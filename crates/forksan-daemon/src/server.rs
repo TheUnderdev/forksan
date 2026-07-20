@@ -133,6 +133,8 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     overlap: e.parsed.def.overlap,
                     model: e.parsed.def.model.clone(),
                     tags: e.parsed.def.tags.clone(),
+                    allowed_tools: e.parsed.def.allowed_tools.clone(),
+                    permission_mode: e.parsed.def.permission_mode.clone(),
                     warnings: e
                         .parsed
                         .warnings

@@ -200,6 +200,12 @@ pub async fn run_one_fork(
         .env("DISABLE_AUTOUPDATER", "1")
         .env("DISABLE_TELEMETRY", "1")
         .env("DISABLE_ERROR_REPORTING", "1")
+        // The parent session's identity, so a fork can key per-session state
+        // on disk deterministically (cwd alone is not unique).
+        .env("FORKSAN_SESSION_ID", session_id)
+        .env("FORKSAN_FORK_NAME", &sel.name)
+        .env("FORKSAN_TRIGGER", &sel.trigger)
+        .env("FORKSAN_PROJECT_ROOT", project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -207,6 +213,20 @@ pub async fn run_one_fork(
         .process_group(0);
     if let Some(model) = &sel.def.model {
         cmd.arg("--model").arg(model);
+    }
+    // Fork permissions: a headless fork can't answer prompts, so grant it the
+    // rules it needs up front. `--allowedTools` is variadic (flag + entries).
+    if !sel.def.allowed_tools.is_empty() {
+        cmd.arg("--allowedTools").args(&sel.def.allowed_tools);
+    }
+    // Permission mode: the fork's own value wins, else the config default.
+    if let Some(mode) = sel
+        .def
+        .permission_mode
+        .as_deref()
+        .or(cfg.permission_mode.as_deref())
+    {
+        cmd.arg("--permission-mode").arg(mode);
     }
 
     daemon

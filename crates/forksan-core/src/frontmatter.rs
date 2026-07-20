@@ -1,9 +1,10 @@
 //! The fork definition format: a markdown file with YAML frontmatter.
 //!
 //! Top-level keys only (`description`, `run_on`, `delivery`, `throttle`,
-//! `after`, `overlap`, `model`, `tags`); unknown keys are ignored for forward
-//! compatibility, and invalid values warn and fall back rather than dropping
-//! the fork. There is deliberately no RAG surface in this format.
+//! `after`, `overlap`, `model`, `tags`, `allowed_tools`, `permission_mode`);
+//! unknown keys are ignored for forward compatibility, and invalid values
+//! warn and fall back rather than dropping the fork. There is deliberately no
+//! RAG surface in this format.
 
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
@@ -33,6 +34,13 @@ pub struct ForkDef {
     /// Free-form tags used by the per-session enable/disable filter. Empty
     /// when unset.
     pub tags: Vec<String>,
+    /// Permission rules granted to the fork subprocess, each passed verbatim
+    /// to `--allowedTools` (e.g. `Write`, `Bash(git add:*)`). Empty when unset
+    /// — a headless fork can then only use read-only tools.
+    pub allowed_tools: Vec<String>,
+    /// Optional `--permission-mode` for the fork subprocess (`default`,
+    /// `acceptEdits`, or `bypassPermissions`). `None` = no flag.
+    pub permission_mode: Option<String>,
 }
 
 impl Default for ForkDef {
@@ -46,6 +54,8 @@ impl Default for ForkDef {
             overlap: false,
             model: None,
             tags: Vec::new(),
+            allowed_tools: Vec::new(),
+            permission_mode: None,
         }
     }
 }
@@ -327,6 +337,58 @@ fn parse_tags(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> 
     out
 }
 
+/// Parse the `allowed_tools` value: a scalar string or a list of strings.
+/// Entries are trimmed and empties dropped, but — unlike `tags` — never
+/// comma-split, since a permission rule (`Bash(git add:*)`) is an opaque
+/// string that may itself contain commas. Non-string entries warn and skip.
+fn parse_allowed_tools(
+    v: &serde_yaml::Value,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    fn push_one(s: &str, out: &mut Vec<String>) {
+        let t = s.trim();
+        if !t.is_empty() && !out.iter().any(|e| e == t) {
+            out.push(t.to_string());
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    match v {
+        serde_yaml::Value::String(s) => push_one(s, &mut out),
+        serde_yaml::Value::Sequence(seq) => {
+            for entry in seq {
+                match entry {
+                    serde_yaml::Value::String(s) => push_one(s, &mut out),
+                    _ => warnings.push(format!(
+                        "fork '{name}': allowed_tools entry is not a string, skipping"
+                    )),
+                }
+            }
+        }
+        serde_yaml::Value::Null => {}
+        _ => warnings.push(format!(
+            "fork '{name}': allowed_tools must be a string or a list of strings, ignoring"
+        )),
+    }
+    out
+}
+
+/// Parse `permission_mode`: one of the claude headless modes. `plan` is
+/// rejected (a headless fork can't act on a plan); unknown values warn and
+/// yield `None` (no flag emitted).
+fn parse_permission_mode(v: &str, name: &str, warnings: &mut Vec<String>) -> Option<String> {
+    match v.trim() {
+        "" => None,
+        m @ ("default" | "acceptEdits" | "bypassPermissions") => Some(m.to_string()),
+        other => {
+            warnings.push(format!(
+                "fork '{name}': unknown permission_mode '{other}', ignoring"
+            ));
+            None
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct RawFork {
     #[serde(default)]
@@ -345,6 +407,10 @@ struct RawFork {
     model: Option<String>,
     #[serde(default)]
     tags: Option<serde_yaml::Value>,
+    #[serde(default)]
+    allowed_tools: Option<serde_yaml::Value>,
+    #[serde(default)]
+    permission_mode: Option<String>,
     // Recognized-and-rejected: the format has no RAG surface.
     #[serde(default)]
     rag: Option<serde_yaml::Value>,
@@ -483,6 +549,17 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         .map(|v| parse_tags(v, name, &mut warnings))
         .unwrap_or_default();
 
+    let allowed_tools = raw
+        .allowed_tools
+        .as_ref()
+        .map(|v| parse_allowed_tools(v, name, &mut warnings))
+        .unwrap_or_default();
+
+    let permission_mode = raw
+        .permission_mode
+        .as_deref()
+        .and_then(|v| parse_permission_mode(v, name, &mut warnings));
+
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
     }
@@ -497,6 +574,8 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
             overlap,
             model: raw.model.filter(|m| !m.trim().is_empty()),
             tags,
+            allowed_tools,
+            permission_mode,
         },
         body: body.to_string(),
         warnings,
@@ -781,6 +860,56 @@ mod tests {
     fn tags_trimmed_and_deduped() {
         let p = parse("---\ntags: [ci, ci , '  review  ', '']\n---\n");
         assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn allowed_tools_as_list() {
+        let p = parse("---\nallowed_tools: [Write, 'Bash(git add:*)']\n---\n");
+        assert_eq!(
+            p.def.allowed_tools,
+            vec!["Write".to_string(), "Bash(git add:*)".to_string()]
+        );
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn allowed_tools_as_scalar_is_not_comma_split() {
+        // A single rule may contain commas and must survive intact.
+        let p = parse("---\nallowed_tools: 'Bash(git add:*, git commit:*)'\n---\n");
+        assert_eq!(p.def.allowed_tools, vec!["Bash(git add:*, git commit:*)"]);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn allowed_tools_junk_entry_warns_and_skips() {
+        let p = parse("---\nallowed_tools: [Write, 42, Edit]\n---\n");
+        assert_eq!(
+            p.def.allowed_tools,
+            vec!["Write".to_string(), "Edit".to_string()]
+        );
+        assert_eq!(p.warnings.len(), 1);
+    }
+
+    #[test]
+    fn permission_mode_valid_and_unknown() {
+        let p = parse("---\npermission_mode: acceptEdits\n---\n");
+        assert_eq!(p.def.permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(p.warnings.is_empty());
+        // `plan` is a valid claude mode but nonsensical for a headless fork.
+        let p = parse("---\npermission_mode: plan\n---\n");
+        assert_eq!(p.def.permission_mode, None);
+        assert_eq!(p.warnings.len(), 1);
+        let p = parse("---\npermission_mode: pigeon\n---\n");
+        assert_eq!(p.def.permission_mode, None);
+        assert_eq!(p.warnings.len(), 1);
+    }
+
+    #[test]
+    fn permissions_absent_default_empty() {
+        let p = parse("---\ndescription: d\n---\n");
+        assert!(p.def.allowed_tools.is_empty());
+        assert_eq!(p.def.permission_mode, None);
         assert!(p.warnings.is_empty());
     }
 

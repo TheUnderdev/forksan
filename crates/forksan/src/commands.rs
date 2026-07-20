@@ -125,6 +125,17 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
+        if !f.allowed_tools.is_empty() {
+            // Short lists inline; longer ones summarized to keep the line tidy.
+            if f.allowed_tools.len() <= 3 {
+                details.push(format!("allowed tools: {}", f.allowed_tools.join(", ")));
+            } else {
+                details.push(format!("allowed tools: {} rules", f.allowed_tools.len()));
+            }
+        }
+        if let Some(m) = &f.permission_mode {
+            details.push(format!("permission mode: {m}"));
+        }
         if f.overlap {
             details.push("overlap allowed".into());
         }
