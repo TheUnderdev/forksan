@@ -118,8 +118,17 @@ pub fn build_wake_payload(session_id: &str, project_root: &str, forks: &[DueFork
         "After spawning all forks above, reply with one short line acknowledging the \
          background work and stop."
     };
-    format!("{}\n\n{closer}", blocks.join("\n\n"))
+    format!("{}\n\n{closer}{CONTINGENCY}", blocks.join("\n\n"))
 }
+
+/// Rides in every wake so an older Claude Code without the `fork` subagent type
+/// degrades to a visible one-liner instead of retrying or substituting a
+/// (context-less) agent that can't do a fork's job.
+const CONTINGENCY: &str = " If the Agent tool reports that the 'fork' agent type is not \
+    available, do NOT retry and do NOT substitute another agent type (other agents don't \
+    inherit this conversation and cannot do a fork's job). Instead reply with one line: \
+    forksan requires a Claude Code version with the fork subagent type — forks are disabled \
+    in this session. Then stop.";
 
 #[cfg(test)]
 mod tests {
@@ -177,6 +186,9 @@ mod tests {
         // overlap:false → skip-if-running line present.
         assert!(p.contains("skip spawning it"));
         assert!(p.contains("After spawning the fork above"));
+        // Contingency for installs without the fork subagent type.
+        assert!(p.contains("'fork' agent type is not available"));
+        assert!(p.contains("forks are disabled in this session"));
     }
 
     #[test]

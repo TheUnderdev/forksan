@@ -11,6 +11,31 @@ fn connect(paths: &Paths) -> Result<Client, String> {
     Client::connect_or_spawn(paths, Duration::from_secs(5)).map_err(|e| e.to_string())
 }
 
+/// Claude Code version at which the `fork` subagent type is enabled by default
+/// in interactive sessions.
+const FORK_DEFAULT_VERSION: [u64; 3] = [2, 1, 161];
+/// Version at which the `fork` subagent type first exists (gated behind
+/// `CLAUDE_CODE_FORK_SUBAGENT=1` until [`FORK_DEFAULT_VERSION`]).
+const FORK_GATED_VERSION: [u64; 3] = [2, 1, 117];
+
+/// Extract the first `x.y.z` triple from `claude --version` output (which may
+/// be just the number or include trailing text). `None` if none is found.
+fn parse_version(s: &str) -> Option<[u64; 3]> {
+    for tok in s.split(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+        let mut it = tok.split('.');
+        let a = it.next().and_then(|x| x.parse::<u64>().ok());
+        let b = it.next().and_then(|x| x.parse::<u64>().ok());
+        let c = it.next().and_then(|x| {
+            let digits: String = x.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            digits.parse::<u64>().ok()
+        });
+        if let (Some(a), Some(b), Some(c)) = (a, b, c) {
+            return Some([a, b, c]);
+        }
+    }
+    None
+}
+
 fn fmt_ago(now: i64, ts: i64) -> String {
     let d = (now - ts).max(0);
     match d {
@@ -44,8 +69,9 @@ pub fn status(paths: &Paths) -> Result<(), String> {
             .prompt_tokens
             .map(|n| format!(", ~{n} prompt tokens"))
             .unwrap_or_default();
+        let stale = if s.stale { " [stale?]" } else { "" };
         println!(
-            "  session {} [{}] {} (active {}{tokens})",
+            "  session {} [{}]{stale} {} (active {}{tokens})",
             &s.session_id[..s.session_id.len().min(8)],
             s.status,
             s.project_root.display(),
@@ -259,6 +285,36 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         println!("  note: no state db yet at {}", paths.db().display());
     }
 
+    // Claude Code version gating for the `fork` subagent type:
+    //   >= 2.1.161            enabled by default in interactive sessions
+    //   2.1.117 ..= 2.1.160   exists but gated behind CLAUDE_CODE_FORK_SUBAGENT=1
+    //   < 2.1.117             no fork subagent — too old for forksan v0.5
+    match std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            let raw = raw.trim();
+            match parse_version(raw) {
+                Some(v) if v >= FORK_DEFAULT_VERSION => ok(&format!("claude: {raw}")),
+                Some(v) if v >= FORK_GATED_VERSION => {
+                    println!("  WARN: claude {raw}: the fork subagent is gated on this version —");
+                    println!("        export CLAUDE_CODE_FORK_SUBAGENT=1 or upgrade to >= 2.1.161");
+                }
+                Some(_) => {
+                    problems += 1;
+                    println!(
+                        "  PROBLEM: claude {raw} is too old for forksan v0.5 (needs the fork \
+                         subagent, >= 2.1.117)"
+                    );
+                }
+                None => println!("  note: could not parse 'claude --version' output ({raw:?})"),
+            }
+        }
+        _ => println!("  note: could not run 'claude --version' to check fork subagent support"),
+    }
+
     println!(
         "  note: v0.5 forks run as fork subagents of your interactive session — no headless\n\
          \x20       fork subprocesses, and no separate fork-session transcripts to prune."
@@ -269,5 +325,27 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{problems} problem(s) found"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_parsing_and_gating() {
+        assert_eq!(parse_version("2.1.161"), Some([2, 1, 161]));
+        assert_eq!(parse_version("2.1.161 (Claude Code)"), Some([2, 1, 161]));
+        assert_eq!(parse_version("v2.1.117-beta"), None); // leading 'v' breaks the first token
+        assert_eq!(parse_version("2.1.117-beta"), Some([2, 1, 117]));
+        assert_eq!(parse_version("nonsense output"), None);
+
+        // Gating thresholds.
+        assert!(parse_version("2.1.161").unwrap() >= FORK_DEFAULT_VERSION);
+        assert!(parse_version("2.2.0").unwrap() >= FORK_DEFAULT_VERSION);
+        let gated = parse_version("2.1.150").unwrap();
+        assert!(gated < FORK_DEFAULT_VERSION && gated >= FORK_GATED_VERSION);
+        assert!(parse_version("2.1.116").unwrap() < FORK_GATED_VERSION);
+        assert!(parse_version("2.0.999").unwrap() < FORK_GATED_VERSION);
     }
 }

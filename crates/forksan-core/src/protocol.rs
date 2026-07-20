@@ -139,6 +139,10 @@ pub struct SessionInfo {
     /// Unix epoch seconds.
     pub last_activity: i64,
     pub prompt_tokens: Option<u64>,
+    /// Open, but with no parked poll and no activity for a long time — likely a
+    /// session whose Claude process died mid-turn (annotated `[stale?]`).
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

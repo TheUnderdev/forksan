@@ -35,50 +35,100 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
 async fn handle_conn(daemon: &Arc<Daemon>, stream: UnixStream) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            // EOF/error between requests is a normal close.
+            _ => return,
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let (id, body) = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => {
-                let id = req.id;
-                // The frozen shutdown frame works across any proto skew; all
-                // other bodies require a proto match.
-                let mismatch =
-                    req.proto != PROTO_VERSION && !matches!(req.body, RequestBody::Shutdown { .. });
-                if mismatch {
-                    (
-                        id,
-                        ResponseBody::Error {
-                            code: ErrorCode::ProtoMismatch,
-                            message: format!(
-                                "daemon speaks proto {PROTO_VERSION}, client sent {}",
-                                req.proto
-                            ),
-                        },
-                    )
-                } else {
-                    (id, dispatch(daemon, req.body).await)
+        let req = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => req,
+            Err(e) => {
+                let _ = write_body(
+                    &mut write,
+                    0,
+                    ResponseBody::Error {
+                        code: ErrorCode::BadRequest,
+                        message: format!("bad request: {e}"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let id = req.id;
+        // The frozen shutdown frame works across any proto skew; all other
+        // bodies require a proto match.
+        if req.proto != PROTO_VERSION && !matches!(req.body, RequestBody::Shutdown { .. }) {
+            let _ = write_body(
+                &mut write,
+                id,
+                ResponseBody::Error {
+                    code: ErrorCode::ProtoMismatch,
+                    message: format!(
+                        "daemon speaks proto {PROTO_VERSION}, client sent {}",
+                        req.proto
+                    ),
+                },
+            )
+            .await;
+            continue;
+        }
+
+        // A StopWait may park for a long time. Race the park against the read
+        // half: if the connection drops before we answer, the Claude process
+        // died — that's a lost poll, not a normal answer/cancel.
+        if let RequestBody::StopWait(ev) = req.body {
+            let session_id = ev.session_id.clone();
+            let fut = daemon.handle_stop_wait(ev);
+            tokio::pin!(fut);
+            let answer = loop {
+                tokio::select! {
+                    resp = &mut fut => break Some(resp),
+                    next = lines.next_line() => match next {
+                        // A stray line while parked — ignore and keep waiting.
+                        Ok(Some(_)) => continue,
+                        // EOF/error before we answered: the poll was lost.
+                        _ => break None,
+                    },
+                }
+            };
+            match answer {
+                Some(body) => {
+                    if write_body(&mut write, id, body).await.is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    daemon.on_poll_lost(&session_id);
+                    return;
                 }
             }
-            Err(e) => (
-                0,
-                ResponseBody::Error {
-                    code: ErrorCode::BadRequest,
-                    message: format!("bad request: {e}"),
-                },
-            ),
-        };
-        let resp = Response {
-            proto: PROTO_VERSION,
-            id,
-            body,
-        };
-        let Ok(line) = encode(&resp) else { break };
-        if write.write_all(line.as_bytes()).await.is_err() {
-            break;
+            continue;
+        }
+
+        let body = dispatch(daemon, req.body).await;
+        if write_body(&mut write, id, body).await.is_err() {
+            return;
         }
     }
+}
+
+async fn write_body(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    body: ResponseBody,
+) -> std::io::Result<()> {
+    let resp = Response {
+        proto: PROTO_VERSION,
+        id,
+        body,
+    };
+    let line = encode(&resp).map_err(std::io::Error::other)?;
+    write.write_all(line.as_bytes()).await
 }
 
 async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
@@ -133,17 +183,29 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
 }
 
 fn status(daemon: &Arc<Daemon>) -> ResponseBody {
+    let now = crate::daemon::now();
     let store = daemon.store.lock().unwrap();
     let sessions = store
         .list_open_sessions()
         .unwrap_or_default()
         .into_iter()
-        .map(|s| SessionInfo {
-            session_id: s.session_id,
-            project_root: s.project_root,
-            status: s.status.as_str().to_string(),
-            last_activity: s.last_activity,
-            prompt_tokens: s.prompt_tokens,
+        .map(|s| {
+            // Cheap honesty for a mid-turn crash the poll-loss path can't see:
+            // open, no parked poll, and idle far past the deadline.
+            let deadline = daemon
+                .cfg_for(Some(&s.project_root))
+                .default_idle_deadline_secs;
+            let stale = !daemon.is_parked(&s.session_id)
+                && deadline > 0
+                && (now - s.last_activity) > 2 * deadline as i64;
+            SessionInfo {
+                session_id: s.session_id,
+                project_root: s.project_root,
+                status: s.status.as_str().to_string(),
+                last_activity: s.last_activity,
+                prompt_tokens: s.prompt_tokens,
+                stale,
+            }
         })
         .collect();
     let recent_runs = store

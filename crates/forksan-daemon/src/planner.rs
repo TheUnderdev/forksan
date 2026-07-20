@@ -196,7 +196,11 @@ pub fn build_wake(
     // Resolve `after` dependencies within the selected set.
     let deps = resolve_deps(&selected);
 
-    // Stamp throttles and once-per-session latches at wake-issuance.
+    // Stamp throttles and latches at wake-issuance. Accepted limitation: the
+    // daemon can't observe spawn outcomes, so a context_* trigger that wakes a
+    // session lacking fork support still consumes its once-per-session latch (and
+    // throttles still stamp) even though no fork ran. The visible one-liner in
+    // the wake payload tells the user why nothing happened.
     let t = now();
     {
         let store = daemon.store.lock().unwrap();

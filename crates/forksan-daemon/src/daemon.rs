@@ -10,10 +10,10 @@
 use forksan_core::config::{load_config_at, Config, Paths};
 use forksan_core::moments::{idle_deadlines, ForkMoment, DEFAULT_CONTEXT_WINDOW};
 use forksan_core::protocol::{Event, EventKind, ResponseBody};
-use forksan_core::store::Store;
+use forksan_core::store::{SessionStatus, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -59,6 +59,15 @@ pub struct Daemon {
     /// (prompt-less) PromptSubmit shortly after a wake as a non-waking
     /// continuation (the daemon-side belt).
     pub wake_issued_at: Mutex<HashMap<String, i64>>,
+    /// Sessions with a currently-parked stop-wait poll (a liveness heartbeat:
+    /// the poll's hook subprocess dies with the Claude process). Values are
+    /// reference counts, so the entry exists iff a poll is parked.
+    pub parked: Mutex<HashMap<String, usize>>,
+    /// Sessions with a pending grace-close after a lost poll, keyed to a
+    /// generation so any fresh event cancels the close regardless of the
+    /// (whole-second) clock granularity.
+    pub pending_close: Mutex<HashMap<String, u64>>,
+    pub close_gen: AtomicU64,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
     pub shutdown: tokio::sync::Notify,
@@ -68,6 +77,52 @@ pub struct Daemon {
 /// assumed to be a continuation rather than genuine user activity.
 const WAKE_GRACE_SECS: i64 = 20;
 
+/// After a parked poll drops unanswered, wait this long for a fresh event
+/// before closing the session (the Claude process is presumed dead). Overridable
+/// via `FORKSAN_POLL_LOSS_GRACE_MS` (tests shorten it).
+fn poll_loss_grace() -> Duration {
+    std::env::var("FORKSAN_POLL_LOSS_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(90))
+}
+
+/// RAII marker that a session has a parked stop-wait poll. Increments on
+/// creation and decrements on drop — including when the poll future is dropped
+/// mid-await (a lost connection), so `parked` stays accurate on every exit path.
+pub struct ParkGuard {
+    daemon: Arc<Daemon>,
+    session_id: String,
+}
+
+impl ParkGuard {
+    fn new(daemon: &Arc<Daemon>, session_id: &str) -> Self {
+        *daemon
+            .parked
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_insert(0) += 1;
+        Self {
+            daemon: daemon.clone(),
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        let mut parked = self.daemon.parked.lock().unwrap();
+        if let Some(c) = parked.get_mut(&self.session_id) {
+            *c -= 1;
+            if *c == 0 {
+                parked.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 impl Daemon {
     pub fn new(paths: Paths, store: Store) -> Arc<Self> {
         Arc::new(Self {
@@ -75,6 +130,9 @@ impl Daemon {
             store: Mutex::new(store),
             waits: Mutex::new(HashMap::new()),
             wake_issued_at: Mutex::new(HashMap::new()),
+            parked: Mutex::new(HashMap::new()),
+            pending_close: Mutex::new(HashMap::new()),
+            close_gen: AtomicU64::new(0),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
             shutdown: tokio::sync::Notify::new(),
@@ -114,6 +172,54 @@ impl Daemon {
             .insert(session_id.to_string(), now());
     }
 
+    /// Whether a session currently has a parked stop-wait poll.
+    pub fn is_parked(&self, session_id: &str) -> bool {
+        self.parked.lock().unwrap().contains_key(session_id)
+    }
+
+    /// Cancel any pending grace-close for a session (a fresh event proves it is
+    /// alive). Called on every event and whenever a new poll parks.
+    fn clear_pending_close(&self, session_id: &str) {
+        self.pending_close.lock().unwrap().remove(session_id);
+    }
+
+    /// A parked poll dropped without the daemon answering it (no Wake, no
+    /// Waited): the Claude process likely died. After a grace window, close the
+    /// session unless a fresh event cancelled the pending close. A later event
+    /// re-opens it via the normal upsert path.
+    ///
+    /// Note: the asyncRewake hook's own 14400s timeout also drops the poll on a
+    /// live-but-long-idle session; the grace-close will close it, and the next
+    /// real event re-opens it — acceptable self-correction.
+    pub fn on_poll_lost(self: &Arc<Self>, session_id: &str) {
+        let gen = self.close_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pending_close
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), gen);
+        let daemon = self.clone();
+        let sid = session_id.to_string();
+        let grace = poll_loss_grace();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            // Still the same pending close (no fresh event superseded it)?
+            {
+                let mut pc = daemon.pending_close.lock().unwrap();
+                if pc.get(&sid) != Some(&gen) {
+                    return;
+                }
+                pc.remove(&sid);
+            }
+            let store = daemon.store.lock().unwrap();
+            if let Ok(Some(s)) = store.get_session(&sid) {
+                if s.status == SessionStatus::Open {
+                    tracing::info!(session = %sid, "stop-wait lost, closing session");
+                    let _ = store.close_session(&sid);
+                }
+            }
+        });
+    }
+
     /// Whether a wake was issued for this session within the grace window.
     fn recently_woke(&self, session_id: &str, t: i64) -> bool {
         self.wake_issued_at
@@ -126,6 +232,9 @@ impl Daemon {
     /// Handle one fast lifecycle event; returns the response body.
     pub async fn handle_event(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
+        // A fresh event proves the session is alive: cancel any pending
+        // lost-poll close.
+        self.clear_pending_close(&ev.session_id);
         let t = now();
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
@@ -193,6 +302,8 @@ impl Daemon {
     /// is cancelled / the daemon retires (returning `Waited`).
     pub async fn handle_stop_wait(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
+        // A new poll parking proves the session is alive.
+        self.clear_pending_close(&ev.session_id);
         let t = now();
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
@@ -222,6 +333,10 @@ impl Daemon {
         if let Some(old) = self.waits.lock().unwrap().insert(ev.session_id.clone(), tx) {
             let _ = old.send(());
         }
+        // Mark the session as having a live parked poll (a liveness heartbeat).
+        // The guard is dropped on every exit path, including when this future is
+        // dropped because the connection was lost.
+        let _park = ParkGuard::new(self, &ev.session_id);
 
         let Some(session) = ({
             let store = self.store.lock().unwrap();

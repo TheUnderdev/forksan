@@ -21,6 +21,7 @@ struct Harness {
     socket: PathBuf,
     project: PathBuf,
     daemon: Option<Child>,
+    poll_grace_ms: Option<u64>,
 }
 
 impl Harness {
@@ -44,7 +45,13 @@ impl Harness {
             home,
             project,
             daemon: None,
+            poll_grace_ms: None,
         }
+    }
+
+    fn poll_grace_ms(mut self, ms: u64) -> Self {
+        self.poll_grace_ms = Some(ms);
+        self
     }
 
     fn write_fork(&self, rel: &str, content: &str) {
@@ -66,14 +73,16 @@ impl Harness {
     }
 
     fn start_daemon(&mut self) {
-        let child = Command::new(env!("CARGO_BIN_EXE_forksan-daemon"))
-            .env("FORKSAN_HOME", &self.home)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_forksan-daemon"));
+        cmd.env("FORKSAN_HOME", &self.home)
             .env("FORKSAN_SOCKET", &self.socket)
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if let Some(ms) = self.poll_grace_ms {
+            cmd.env("FORKSAN_POLL_LOSS_GRACE_MS", ms.to_string());
+        }
+        let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
         let start = Instant::now();
         loop {
@@ -172,6 +181,34 @@ impl Harness {
             ResponseBody::StatusInfo(info) => info.recent_runs.len(),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    fn open_sessions(&self) -> Vec<forksan_core::protocol::SessionInfo> {
+        match self.request(RequestBody::Status) {
+            ResponseBody::StatusInfo(info) => info.sessions,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn has_open_session(&self, session: &str) -> bool {
+        self.open_sessions().iter().any(|s| s.session_id == session)
+    }
+
+    /// Park a StopWait, then drop the connection WITHOUT reading a response —
+    /// simulating the Claude process (and its hook subprocess) dying.
+    fn drop_stop_wait(&self, ev: Event) {
+        let stream = UnixStream::connect(&self.socket).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let req = Request {
+            proto: PROTO_VERSION,
+            id: 1,
+            body: RequestBody::StopWait(ev),
+        };
+        writer.write_all(encode(&req).unwrap().as_bytes()).unwrap();
+        // Give the daemon a moment to read the request and park before we close.
+        std::thread::sleep(Duration::from_millis(150));
+        drop(writer);
+        drop(stream);
     }
 }
 
@@ -579,6 +616,91 @@ fn throttle_holds_across_pauses() {
         rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
         ResponseBody::Waited
     ));
+}
+
+#[test]
+fn lost_poll_closes_session_after_grace() {
+    let mut h = Harness::new("1h", "0").poll_grace_ms(400);
+    h.write_fork("j.md", "---\nfork: true\nrun_on: [idle]\n---\nbody");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert!(h.has_open_session("s1"));
+
+    // The Claude process dies: its parked poll drops unanswered.
+    h.drop_stop_wait(h.event(EventKind::Stop, "s1"));
+    // Within the grace it is still open...
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(h.has_open_session("s1"), "closed before the grace elapsed");
+    // ...and after the grace with no fresh event, it is closed.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !h.has_open_session("s1"),
+        "lost poll did not close the session"
+    );
+
+    // A later event re-opens it via the normal upsert path.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert!(
+        h.has_open_session("s1"),
+        "a later event did not re-open the session"
+    );
+}
+
+#[test]
+fn event_within_grace_keeps_session_open() {
+    let mut h = Harness::new("1h", "0").poll_grace_ms(700);
+    h.write_fork("j.md", "---\nfork: true\nrun_on: [idle]\n---\nbody");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    h.drop_stop_wait(h.event(EventKind::Stop, "s1"));
+    // A fresh event arrives inside the grace window.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    // Past the original grace: the session stays open.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        h.has_open_session("s1"),
+        "grace-close fired despite a fresh event"
+    );
+}
+
+#[test]
+fn answered_poll_never_triggers_grace_close() {
+    let mut h = Harness::new("1s", "0").poll_grace_ms(400);
+    h.write_fork("j.md", "---\nfork: true\nrun_on: [idle]\n---\nbody");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // A normally-answered Wake closes its connection afterward — that must NOT
+    // count as a lost poll.
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let _ = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    std::thread::sleep(Duration::from_millis(600)); // > grace
+    assert!(
+        h.has_open_session("s1"),
+        "an answered poll wrongly closed the session"
+    );
+}
+
+#[test]
+fn stale_annotation_for_idle_open_session_without_poll() {
+    let mut h = Harness::new("1s", "0"); // 2×deadline = 2s
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    // No parked poll; wait comfortably past 2× the idle deadline (whole-second
+    // timestamps mean the difference must clear 2 full seconds).
+    std::thread::sleep(Duration::from_millis(3300));
+    let stale = h
+        .open_sessions()
+        .into_iter()
+        .find(|s| s.session_id == "s1")
+        .map(|s| s.stale)
+        .unwrap_or(false);
+    assert!(
+        stale,
+        "an old open session with no poll should be flagged stale"
+    );
 }
 
 #[test]

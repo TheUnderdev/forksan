@@ -33,6 +33,20 @@ Because the `fork` subagent type only exists in interactive sessions, **v0.5 is 
 design**; headless/`-p` and postmortem forks are gone. A fork inherits the session's **permissions
 and model** — there is nothing to grant or override.
 
+## Requirements
+
+forksan v0.5+ needs a Claude Code version whose Agent tool supports `subagent_type: "fork"` in
+interactive sessions:
+
+- **Claude Code >= 2.1.161** — the fork subagent is enabled by default (recommended).
+- **2.1.117 – 2.1.160** — it exists but is gated; export `CLAUDE_CODE_FORK_SUBAGENT=1`.
+- **< 2.1.117** — no fork subagent; forksan v0.5 can't run forks.
+
+`forksan doctor` checks your `claude --version` against these thresholds. On a version without fork
+support a wake safely no-ops: the model replies with a visible one-liner ("forksan requires a Claude
+Code version with the fork subagent type — forks are disabled in this session") instead of running
+forks.
+
 ## Install
 
 From the plugin marketplace:
@@ -200,6 +214,9 @@ stamped at **wake-issuance** (when the daemon answers the poll), not at fork com
   dropped).
 - A wake requires a live parked `Stop` hook. If the daemon dies while a session is idle, that idle
   opportunity is simply missed — the next turn re-arms it. A hook never wedges or errors a session.
+- A session whose Claude process dies (killed terminal, restart) is closed automatically: its parked
+  poll drops, and after a short grace with no new event the daemon marks it closed. A stray open
+  session that crashed mid-turn shows a `[stale?]` hint in `forksan status`.
 
 ## v0.4 → v0.5 migration
 
