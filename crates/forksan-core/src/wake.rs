@@ -6,6 +6,27 @@
 //! The parent model is told to spawn each fork with a prompt that makes the
 //! *fork* read the fork file — the parent must never read it itself.
 
+/// The greppable marker every wake block carries (`source: forksan`). The
+/// payload builder emits it and the continuation sniffer anchors on it, so the
+/// two can never drift. It survives Claude Code wrapping the payload in a
+/// system-reminder / task-notification envelope because it appears verbatim
+/// inside the reminder text.
+pub const WAKE_MARKER: &str = "source: forksan";
+
+/// The prefix Claude Code uses for a fork-completion (task) notification the
+/// session receives as a non-waking continuation.
+pub const TASK_NOTIFICATION_PREFIX: &str = "<task-notification>";
+
+/// Whether a submitted "prompt" is actually a non-waking continuation — an
+/// asyncRewake wake reminder (carries [`WAKE_MARKER`]) or a fork-completion
+/// task notification (starts with [`TASK_NOTIFICATION_PREFIX`]) — rather than
+/// genuine user input. Used to decide whether a UserPromptSubmit advances the
+/// pause epoch.
+pub fn looks_like_continuation(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    trimmed.starts_with(TASK_NOTIFICATION_PREFIX) || prompt.contains(WAKE_MARKER)
+}
+
 /// One fork that is due to fire, as the payload builder sees it.
 #[derive(Debug, Clone)]
 pub struct DueFork {
@@ -112,6 +133,36 @@ mod tests {
             overlap,
             after: after.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn payload_carries_the_sniffer_marker() {
+        let p = build_wake_payload("s", "/p", &[due("j", &[], false)]);
+        assert!(
+            p.contains(WAKE_MARKER),
+            "payload must carry the wake marker"
+        );
+        assert!(
+            looks_like_continuation(&p),
+            "the builder's own output must sniff as a continuation"
+        );
+    }
+
+    #[test]
+    fn continuation_sniffer() {
+        assert!(looks_like_continuation(
+            "<task-notification>fork 'j' finished</task-notification>"
+        ));
+        assert!(looks_like_continuation("  \n<task-notification>x"));
+        assert!(looks_like_continuation(
+            "---\nsource: forksan\ndue: journal (trigger: idle)\n---\nSpawn a fork"
+        ));
+        assert!(!looks_like_continuation(
+            "please refactor the config parser"
+        ));
+        assert!(!looks_like_continuation(
+            "what does source mean in forksan?"
+        ));
     }
 
     #[test]

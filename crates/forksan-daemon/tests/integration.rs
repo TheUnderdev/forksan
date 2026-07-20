@@ -106,7 +106,15 @@ impl Harness {
             model: None,
             enable_tags: None,
             disable_tags: None,
+            waking: None,
         }
+    }
+
+    /// A waking (`Some(true)`) or non-waking (`Some(false)`) PromptSubmit.
+    fn prompt_submit(&self, session: &str, waking: bool) -> Event {
+        let mut ev = self.event(EventKind::PromptSubmit, session);
+        ev.waking = Some(waking);
+        ev
     }
 
     /// One-shot request/response over a fresh connection.
@@ -374,8 +382,10 @@ fn tag_throttle_suppresses_group_but_other_tag_wakes() {
     let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(payload.contains("due: a") && payload.contains("due: b") && payload.contains("due: c"));
 
-    // Second turn: the ci group is throttled (a and b suppressed); the docs
-    // fork (c) still wakes.
+    // A new pause (real user activity) releases the once-per-pause latches, so
+    // the second turn is decided by the tag throttle alone: the ci group is
+    // still suppressed (throttle holds across pauses); the docs fork (c) wakes.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
     let rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
     let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(
@@ -469,6 +479,106 @@ fn debounce_batches_forks_across_the_window() {
     assert_eq!(payload.matches("After spawning all forks above").count(), 1);
     // Two wakes stamped in one issuance.
     assert_eq!(h.status_recent_runs(), 2);
+}
+
+#[test]
+fn idle_fork_fires_at_most_once_per_pause() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork("j.md", "---\nfork: true\nrun_on: [idle]\n---\nbody");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // Pause 1: the idle deadline wakes fork j.
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: j"));
+    assert_eq!(h.status_recent_runs(), 1);
+
+    // The wake turn runs and ends: a non-waking continuation prompt, then its
+    // own Stop re-parks. j is latched for this pause — no second wake, even
+    // after the idle deadline elapses again.
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    let rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        rx2.try_recv().is_err(),
+        "fork re-fired within the same pause"
+    );
+    // Cancel the still-parked wait (another non-waking prompt).
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+    // Only the single first wake was ever issued.
+    assert_eq!(h.status_recent_runs(), 1);
+
+    // Genuine user activity starts a new pause: j is due again.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let rx3 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        payload.contains("due: j"),
+        "new pause did not re-arm the fork"
+    );
+    assert_eq!(h.status_recent_runs(), 2);
+}
+
+#[test]
+fn ambiguous_prompt_within_grace_is_treated_as_continuation() {
+    // The daemon-side belt: a PromptSubmit with no `waking` flag arriving right
+    // after a wake is assumed to be a continuation (no epoch advance).
+    let mut h = Harness::new("1s", "0");
+    h.write_fork("j.md", "---\nfork: true\nrun_on: [idle]\n---\nbody");
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let _ = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // Ambiguous prompt (waking = None) inside the grace window → non-waking.
+    assert_ack(h.send_event(h.event(EventKind::PromptSubmit, "s1")));
+
+    let rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        rx2.try_recv().is_err(),
+        "belt failed: ambiguous prompt advanced the pause"
+    );
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+}
+
+#[test]
+fn throttle_holds_across_pauses() {
+    let mut h = Harness::new("1s", "0");
+    h.write_fork(
+        "j.md",
+        "---\nfork: true\nrun_on: [idle]\nthrottle: 1h\n---\nbody",
+    );
+    h.start_daemon();
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // Pause 1: wake, stamping the 1h throttle.
+    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    let _ = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // A real user prompt starts a fresh pause — but the throttle still holds.
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let rx2 = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        rx2.try_recv().is_err(),
+        "throttle didn't hold across pauses"
+    );
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
 }
 
 #[test]

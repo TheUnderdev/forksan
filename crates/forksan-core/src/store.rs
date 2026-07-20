@@ -15,7 +15,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -45,6 +45,13 @@ pub struct SessionRow {
     pub enable_tags: Option<Vec<String>>,
     /// Per-session disable (blocklist) tag filter; `None` = unset.
     pub disable_tags: Option<Vec<String>>,
+    /// Advances only on genuine user activity (a real UserPromptSubmit). Idle
+    /// forks latch per (fork, pause_epoch): once per pause.
+    pub pause_epoch: i64,
+    /// The Stop that began the current pause; idle deadlines are measured from
+    /// here, so wake-turn Stops don't reset the clock. `None` until the first
+    /// Stop of a pause.
+    pub pause_started_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +190,17 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 4 {
+            // Per-session pause epoch (advanced only by genuine user activity)
+            // and the pause baseline (first Stop of the current pause) — the
+            // once-per-pause idle latch and idle-deadline timing key off these.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN pause_epoch INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN pause_started_at INTEGER;
+                 COMMIT;",
+            )?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
@@ -238,7 +256,7 @@ impl Store {
             .query_row(
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                         transcript_offset, prompt_tokens, model, created_at,
-                        enable_tags, disable_tags
+                        enable_tags, disable_tags, pause_epoch, pause_started_at
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -264,14 +282,42 @@ impl Store {
             created_at: row.get(9)?,
             enable_tags: split_tags(row.get::<_, Option<String>>(10)?),
             disable_tags: split_tags(row.get::<_, Option<String>>(11)?),
+            pause_epoch: row.get(12)?,
+            pause_started_at: row.get(13)?,
         })
+    }
+
+    /// Advance the pause epoch and clear the pause baseline (genuine user
+    /// activity begins a new pause).
+    pub fn bump_pause_epoch(&self, session_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET pause_epoch = pause_epoch + 1, pause_started_at = NULL
+             WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Set the pause baseline to `now` only if it is unset (the first Stop of
+    /// the current pause). Wake-turn Stops leave the existing baseline.
+    pub fn set_pause_started_at_if_unset(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET pause_started_at = ?2
+             WHERE session_id = ?1 AND pause_started_at IS NULL",
+            params![session_id, now],
+        )?;
+        Ok(())
     }
 
     pub fn list_open_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
                     transcript_offset, prompt_tokens, model, created_at,
-                    enable_tags, disable_tags
+                    enable_tags, disable_tags, pause_epoch, pause_started_at
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
@@ -637,6 +683,34 @@ mod tests {
         let row = s.get_session("a").unwrap().unwrap();
         assert_eq!(row.enable_tags, None);
         assert_eq!(row.disable_tags, None);
+    }
+
+    #[test]
+    fn pause_epoch_and_baseline() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        let row = s.get_session("a").unwrap().unwrap();
+        assert_eq!(row.pause_epoch, 0);
+        assert_eq!(row.pause_started_at, None);
+
+        // First Stop of a pause sets the baseline; later Stops keep it.
+        s.set_pause_started_at_if_unset("a", 110).unwrap();
+        s.set_pause_started_at_if_unset("a", 120).unwrap();
+        assert_eq!(
+            s.get_session("a").unwrap().unwrap().pause_started_at,
+            Some(110)
+        );
+
+        // Genuine activity advances the epoch and clears the baseline.
+        s.bump_pause_epoch("a").unwrap();
+        let row = s.get_session("a").unwrap().unwrap();
+        assert_eq!(row.pause_epoch, 1);
+        assert_eq!(row.pause_started_at, None);
+        s.set_pause_started_at_if_unset("a", 200).unwrap();
+        assert_eq!(
+            s.get_session("a").unwrap().unwrap().pause_started_at,
+            Some(200)
+        );
     }
 
     #[test]

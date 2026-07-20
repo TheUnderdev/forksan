@@ -29,9 +29,24 @@ pub struct SelectedFork {
     pub overlap: bool,
     pub after: Vec<String>,
     pub tags: Vec<String>,
-    /// True for context triggers, which fire at most once per session and so
-    /// get latched at wake-issuance.
-    pub once_per_session: bool,
+    /// The latch this fork consumes at wake-issuance, if any: `context_*`
+    /// triggers latch once per session (key = the trigger label); `idle`
+    /// triggers latch once per pause (key = `idle-pause:<epoch>`). `None` means
+    /// no latch (nothing here today, kept for clarity).
+    pub latch_key: Option<String>,
+}
+
+/// The latch key a matched trigger consumes: context thresholds latch
+/// once-per-session; idle triggers latch once-per-pause (so a fork fires at
+/// most once per idle pause, never re-firing on a wake-turn's own Stop).
+fn latch_key_for(trigger: &ForkRunOn, pause_epoch: i64) -> Option<String> {
+    match trigger {
+        ForkRunOn::Idle { .. } => Some(format!("idle-pause:{pause_epoch}")),
+        ForkRunOn::ContextTokens(_) | ForkRunOn::ContextUsedPct(_) | ForkRunOn::ContextLeft(_) => {
+            Some(trigger.label())
+        }
+        _ => None,
+    }
 }
 
 impl Selected for SelectedFork {
@@ -128,18 +143,16 @@ pub fn select_forks(
                 continue;
             }
         }
-        // Context thresholds fire at most once per session leg; skip a fork
-        // already latched (read-only — the latch is consumed at issuance).
+        // Latch check (read-only — the latch is consumed at issuance): skip a
+        // fork already latched for its trigger's scope. Idle → once per pause;
+        // context_* → once per session.
         let label = trigger.label();
-        let once_per_session = matches!(
-            trigger,
-            ForkRunOn::ContextTokens(_) | ForkRunOn::ContextUsedPct(_) | ForkRunOn::ContextLeft(_)
-        );
-        if once_per_session {
+        let latch_key = latch_key_for(&trigger, session.pause_epoch);
+        if let Some(key) = &latch_key {
             let latched = {
                 let store = daemon.store.lock().unwrap();
                 store
-                    .is_latched(&session.session_id, &entry.fork_name, &label)
+                    .is_latched(&session.session_id, &entry.fork_name, key)
                     .unwrap_or(false)
             };
             if latched {
@@ -153,7 +166,7 @@ pub fn select_forks(
             overlap: parsed.def.overlap,
             after: parsed.def.after.clone(),
             tags: parsed.def.tags.clone(),
-            once_per_session,
+            latch_key,
         });
     }
     selected
@@ -197,11 +210,14 @@ pub fn build_wake(
                 tags_joined.as_deref(),
                 t,
             );
-            if sel.once_per_session {
-                let _ = store.try_latch_fire(&session.session_id, &sel.name, &sel.trigger, t);
+            if let Some(key) = &sel.latch_key {
+                let _ = store.try_latch_fire(&session.session_id, &sel.name, key, t);
             }
         }
     }
+    // Record the wake for the post-wake grace window (belt for ambiguous
+    // continuation PromptSubmits that arrive without prunable prompt text).
+    daemon.note_wake_issued(&session.session_id);
 
     let due: Vec<DueFork> = selected
         .iter()

@@ -35,6 +35,10 @@ struct HookInput {
     source: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// The submitted prompt (UserPromptSubmit). Used to tell genuine user
+    /// activity from a non-waking continuation. Absent for other events.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 pub fn run_hook(kind: HookKind) {
@@ -75,6 +79,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         model: input.model.clone(),
         enable_tags: enable_tags.clone(),
         disable_tags: disable_tags.clone(),
+        waking: None,
     };
 
     match kind {
@@ -91,7 +96,16 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
-            let _ = client.request(RequestBody::Event(event(EventKind::PromptSubmit)));
+            // Sniff the prompt: a continuation (asyncRewake wake reminder or a
+            // fork-completion task notification) is non-waking and must not
+            // advance the pause epoch. `None` (no prompt text) lets the daemon
+            // decide via its post-wake grace window.
+            let mut ev = event(EventKind::PromptSubmit);
+            ev.waking = input
+                .prompt
+                .as_deref()
+                .map(|p| !forksan_core::wake::looks_like_continuation(p));
+            let _ = client.request(RequestBody::Event(ev));
         }
         HookKind::StopWait => {
             // Runs async (Claude Code doesn't block): fine to spawn + retire.

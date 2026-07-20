@@ -104,7 +104,15 @@ Moments for `run_on`:
   each firing at most once per session
 
 Unknown keys are ignored; invalid values warn and fall back to defaults (`forksan forks` shows the
-warnings). Fork bodies should be **idempotent** — a fork may fire at every idle pause.
+warnings). Fork bodies should be **idempotent** — a fork may fire on any idle pause.
+
+**Once per pause.** An idle-triggered fork fires **at most once per idle pause** (restoring the
+pre-v0.5 "fires once per idle pause" semantics). A *pause* is the quiet stretch after one of your
+turns; only genuine user activity starts a new one. This matters because each wake turn — and each
+fork-completion relay turn — ends with its own `Stop`, which re-arms the machinery; without the
+per-pause rule a fork whose `throttle` is shorter than its idle deadline would wake you again every
+cycle, forever. So within a single pause a fork issues one wake and no more, regardless of throttle;
+`throttle` still applies *across* pauses. (`context_*` thresholds are separately once-per-session.)
 
 `after` sequencing: the wake payload tells the model to spawn the root fork(s) now and, once a
 predecessor's completion notification arrives, spawn its dependents with the predecessor's report

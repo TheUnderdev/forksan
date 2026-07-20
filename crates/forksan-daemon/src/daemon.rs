@@ -55,10 +55,18 @@ pub struct Daemon {
     /// Per-session cancellation channels for parked stop-wait long polls.
     /// Sending `()` (or dropping) resolves the parked poll as `Waited`.
     pub waits: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// When we last issued a wake for a session — used to treat an ambiguous
+    /// (prompt-less) PromptSubmit shortly after a wake as a non-waking
+    /// continuation (the daemon-side belt).
+    pub wake_issued_at: Mutex<HashMap<String, i64>>,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
     pub shutdown: tokio::sync::Notify,
 }
+
+/// How long after issuing a wake an ambiguous (no prompt text) PromptSubmit is
+/// assumed to be a continuation rather than genuine user activity.
+const WAKE_GRACE_SECS: i64 = 20;
 
 impl Daemon {
     pub fn new(paths: Paths, store: Store) -> Arc<Self> {
@@ -66,6 +74,7 @@ impl Daemon {
             paths,
             store: Mutex::new(store),
             waits: Mutex::new(HashMap::new()),
+            wake_issued_at: Mutex::new(HashMap::new()),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
             shutdown: tokio::sync::Notify::new(),
@@ -97,6 +106,23 @@ impl Daemon {
         }
     }
 
+    /// Record that a wake was just issued for a session (grace-window belt).
+    pub fn note_wake_issued(&self, session_id: &str) {
+        self.wake_issued_at
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), now());
+    }
+
+    /// Whether a wake was issued for this session within the grace window.
+    fn recently_woke(&self, session_id: &str, t: i64) -> bool {
+        self.wake_issued_at
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|&at| t - at < WAKE_GRACE_SECS)
+    }
+
     /// Handle one fast lifecycle event; returns the response body.
     pub async fn handle_event(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
@@ -119,6 +145,14 @@ impl Daemon {
                 ResponseBody::Ack
             }
             EventKind::PromptSubmit => {
+                // Is this genuine user activity, or a non-waking continuation
+                // (an asyncRewake wake reminder / a fork-completion task
+                // notification)? The CLI sniffs the prompt text (primary); when
+                // it can't tell (`None`), the daemon's post-wake grace window is
+                // the belt.
+                let waking = ev
+                    .waking
+                    .unwrap_or_else(|| !self.recently_woke(&ev.session_id, t));
                 {
                     let store = self.store.lock().unwrap();
                     let _ = store.upsert_session(
@@ -132,9 +166,14 @@ impl Daemon {
                         t,
                     );
                     let _ = store.set_last_activity(&ev.session_id, t);
+                    // Genuine activity begins a new pause: advance the epoch
+                    // (releasing per-pause idle latches) and reset the baseline.
+                    if waking {
+                        let _ = store.bump_pause_epoch(&ev.session_id);
+                    }
                 }
-                // A turn is in flight: cancel any parked stop-wait so no wake
-                // fires mid-turn.
+                // A turn is in flight either way: cancel any parked stop-wait so
+                // no wake fires mid-turn.
                 self.cancel_wait(&ev.session_id);
                 ResponseBody::Ack
             }
@@ -170,6 +209,9 @@ impl Daemon {
                 t,
             );
             let _ = store.set_last_activity(&ev.session_id, t);
+            // The first Stop of a pause sets the baseline; a wake-turn's own
+            // Stop keeps the existing one, so idle deadlines don't reset.
+            let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
         }
         let prompt_tokens = self.read_gauge(&ev);
         let cfg = self.cfg_for(Some(&ev.project_root));
@@ -187,8 +229,11 @@ impl Daemon {
         }) else {
             return ResponseBody::Waited;
         };
+        // Idle timing is measured from the pause baseline (the first Stop of
+        // this pause), so a wake-turn's own Stop doesn't restart the clock.
+        let baseline = session.pause_started_at.unwrap_or(t);
 
-        // Idle deadlines (seconds from the Stop) this session's forks need.
+        // Idle deadlines (seconds from the baseline) this session's forks need.
         let deadlines = {
             let (entries, _) = forksan_core::discovery::discover_forks(
                 &session.cwd,
@@ -204,7 +249,7 @@ impl Daemon {
         // Context thresholds are known immediately (the turn just ended);
         // idle forks come due as their deadlines elapse.
         let due_now = |slf: &Arc<Self>| -> bool {
-            let moments = elapsed_moments(prompt_tokens, t, &deadlines, now());
+            let moments = elapsed_moments(prompt_tokens, baseline, &deadlines, now());
             !moments.is_empty()
                 && !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
         };
@@ -212,7 +257,7 @@ impl Daemon {
         let mut due = due_now(self);
         if !due {
             for &d in &deadlines {
-                let fire_at = t + d as i64;
+                let fire_at = baseline + d as i64;
                 let wait = (fire_at - now()).max(0) as u64;
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(wait)) => {
@@ -245,7 +290,7 @@ impl Daemon {
         // Phase C: re-evaluate over every moment elapsed by now (deadlines that
         // landed during the debounce join the batch), then issue one wake —
         // stamping throttles and latches at this point.
-        let moments = elapsed_moments(prompt_tokens, t, &deadlines, now());
+        let moments = elapsed_moments(prompt_tokens, baseline, &deadlines, now());
         let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
         if let Some(payload) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake { payload };

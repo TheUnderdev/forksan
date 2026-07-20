@@ -57,6 +57,12 @@ pub struct Event {
     /// Per-session disable (blocklist) tag filter, from `FORKSAN_DISABLE_TAGS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_tags: Option<Vec<String>>,
+    /// For a PromptSubmit: whether this is genuine user activity (`Some(true)`)
+    /// or a non-waking continuation — an asyncRewake wake or a fork-completion
+    /// task notification (`Some(false)`). `None` = the CLI couldn't tell (no
+    /// prompt text); the daemon decides via its post-wake grace window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +193,7 @@ mod tests {
                 model: None,
                 enable_tags: None,
                 disable_tags: None,
+                waking: None,
             }),
         };
         let line = encode(&req).unwrap();
