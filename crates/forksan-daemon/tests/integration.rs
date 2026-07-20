@@ -13,16 +13,32 @@ use forksan_core::protocol::{
 };
 use forksan_core::PROTO_VERSION;
 
-/// The stub claude: records its stdin under $STUB_DIR, honors FAIL/SLOW
-/// markers embedded in the prompt, then prints a result JSON.
+/// The stub claude: records its stdin, argv, FORKSAN_* env, and cwd under
+/// $STUB_DIR, honors FAIL/SLOW markers embedded in the prompt, then prints a
+/// result JSON. `STUB_FAIL_RESUME_<N>` fails (exit 1, "No conversation found"
+/// on stderr) for the first N invocations and then succeeds — a stand-in for
+/// the transcript-flush race.
 const STUB: &str = r#"#!/bin/sh
 INPUT=$(cat)
 N=$(date +%s%N)-$$
 mkdir -p "$STUB_DIR"
 printf '%s' "$INPUT" > "$STUB_DIR/prompt-$N.txt"
 printf '%s\n' "$@" > "$STUB_DIR/args-$N.txt"
-printf 'session_id=%s\nfork_name=%s\ntrigger=%s\nproject_root=%s\n' "$FORKSAN_SESSION_ID" "$FORKSAN_FORK_NAME" "$FORKSAN_TRIGGER" "$FORKSAN_PROJECT_ROOT" > "$STUB_DIR/env-$N.txt"
+printf 'session_id=%s\nfork_name=%s\ntrigger=%s\nproject_root=%s\npwd=%s\n' "$FORKSAN_SESSION_ID" "$FORKSAN_FORK_NAME" "$FORKSAN_TRIGGER" "$FORKSAN_PROJECT_ROOT" "$(pwd)" > "$STUB_DIR/env-$N.txt"
 : > "$STUB_DIR/start-$N"
+case "$INPUT" in
+  *STUB_FAIL_RESUME_*)
+    NFAIL=$(printf '%s' "$INPUT" | sed -n 's/.*STUB_FAIL_RESUME_\([0-9][0-9]*\).*/\1/p')
+    COUNT=$(cat "$STUB_DIR/resume-count" 2>/dev/null || echo 0)
+    if [ "${COUNT:-0}" -lt "${NFAIL:-0}" ]; then
+      echo $((COUNT + 1)) > "$STUB_DIR/resume-count"
+      echo "No conversation found with session ID: x" >&2
+      exit 1
+    fi
+    printf '{"result":"stub report %s","session_id":"stub-%s","total_cost_usd":0.01,"is_error":false}\n' "$N" "$N"
+    exit 0
+    ;;
+esac
 case "$INPUT" in
   *STUB_SLOW*) sleep 2 ;;
   *) sleep 0.1 ;;
@@ -110,6 +126,8 @@ impl Harness {
             .env("FORKSAN_HOME", &self.home)
             .env("FORKSAN_SOCKET", &self.socket)
             .env("STUB_DIR", &self.stub_dir)
+            // Short-circuit the resume-retry backoff so tests don't wait 14s.
+            .env("FORKSAN_RETRY_BASE_MS", "20")
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -587,6 +605,88 @@ fn config_permission_mode_applies_and_fork_overrides() {
         .find(|i| i.prompt.contains("INHERIT WORK"))
         .unwrap();
     assert_eq!(mode_after(inherit).as_deref(), Some("bypassPermissions"));
+}
+
+#[test]
+fn resume_race_retries_until_transcript_ready() {
+    let mut h = Harness::new("1h");
+    h.write_fork(
+        "retry.md",
+        "---\nrun_on: [session_start]\n---\nSTUB_FAIL_RESUME_2 do the work",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // The first two resume attempts fail ("No conversation found"); the fork
+    // retries and ultimately delivers a success response.
+    let reports = h.wait_for_responses("s1", Duration::from_secs(10));
+    let resp = reports
+        .iter()
+        .find(|r| r.fork == "retry" && r.kind == ReportKind::Response)
+        .expect("a response for the retry fork");
+    assert!(
+        resp.body.contains("stub report"),
+        "fork did not ultimately succeed: {resp:?}"
+    );
+
+    // Exactly N+1 = 3 invocations: two failed resumes and one success.
+    std::thread::sleep(Duration::from_millis(200));
+    let attempts = h
+        .stub_prompts()
+        .iter()
+        .filter(|p| p.contains("STUB_FAIL_RESUME_2"))
+        .count();
+    assert_eq!(attempts, 3, "expected 2 retries then success");
+}
+
+#[test]
+fn fork_runs_in_pinned_launch_cwd_not_drifted() {
+    let mut h = Harness::new("1h");
+    h.write_fork("end.md", "---\nrun_on: [session_end]\n---\nDRIFT WORK");
+    h.start_daemon();
+
+    // Session launches in the project dir (cwd A).
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    // It later `cd`'d into a subdirectory; a Stop event reports the drifted
+    // cwd B, which must NOT overwrite the pinned launch cwd.
+    let drifted = h.project.join("drifted");
+    std::fs::create_dir_all(&drifted).unwrap();
+    let mut stop = h.event(EventKind::Stop, "s1");
+    stop.cwd = drifted.clone();
+    assert_ack(h.send_event(stop));
+
+    // SessionEnd fires the session_end fork, which must run in cwd A.
+    assert_ack(h.send_event(h.event(EventKind::SessionEnd, "s1")));
+
+    let start = Instant::now();
+    let inv = loop {
+        if let Some(inv) = h
+            .invocations()
+            .into_iter()
+            .find(|i| i.prompt.contains("DRIFT WORK"))
+        {
+            break inv;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "session_end fork never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let pwd = inv
+        .env
+        .lines()
+        .find_map(|l| l.strip_prefix("pwd="))
+        .expect("stub recorded its cwd");
+    assert_eq!(
+        std::path::Path::new(pwd)
+            .file_name()
+            .and_then(|f| f.to_str()),
+        Some("proj"),
+        "fork ran in the drifted cwd instead of the pinned launch dir: {pwd}"
+    );
 }
 
 #[test]

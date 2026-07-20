@@ -133,6 +133,10 @@ sessions run in one directory):
 - `FORKSAN_TRIGGER` — the trigger label (e.g. `idle:240`, `manual_stop`, `manual`)
 - `FORKSAN_PROJECT_ROOT` — the session's project root
 
+A fork always runs from the directory the session was **launched** in, even if the session
+later `cd`'d elsewhere with its Bash tool — that launch directory is where Claude Code stored
+the resumable transcript, so it's pinned per session and used as the fork's working directory.
+
 ## How it works
 
 ```
@@ -246,6 +250,9 @@ fork, which recurs at its next moment. Manual `forksan run` bypasses tag throttl
   a generous `throttle`.
 - The transcript-based context gauge parses an internal Claude Code format; if it changes,
   `context_*` triggers degrade to inactive rather than erroring.
+- A session-end fork can fire before a large session has finished writing its transcript to
+  disk, so `--resume` briefly can't find it; forksan retries the run a few times with backoff
+  while the parent finishes, then gives up and reports the failure.
 
 ## Other tools
 

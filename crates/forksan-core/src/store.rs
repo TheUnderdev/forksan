@@ -211,16 +211,21 @@ impl Store {
         disable_tags: Option<&str>,
         now: i64,
     ) -> rusqlite::Result<()> {
-        // The per-session tag filter always reflects the latest event (the
-        // hook re-sends it on every frame), so it overwrites rather than
-        // coalesces — a cleared env var (NULL) legitimately clears it.
+        // `cwd` is pinned to the first event's value (first write wins): a
+        // Claude Code session's cwd drifts as its Bash tool `cd`s around, but
+        // `--resume` only finds the conversation under the *launch*
+        // directory's project folder, so the fork must run there. Each
+        // resumed leg is a new session id whose first event carries its own
+        // launch cwd, making per-leg pinning exactly right. `transcript_path`
+        // does not drift, so COALESCE is fine there. The per-session tag
+        // filter always reflects the latest event (the hook re-sends it on
+        // every frame), so it overwrites — a cleared env var (NULL) clears it.
         self.conn.execute(
             "INSERT INTO sessions (session_id, project_root, cwd, transcript_path, status,
                                    last_activity, created_at, model, enable_tags, disable_tags)
              VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_id) DO UPDATE SET
                project_root = excluded.project_root,
-               cwd = excluded.cwd,
                transcript_path = COALESCE(excluded.transcript_path, transcript_path),
                model = COALESCE(excluded.model, model),
                enable_tags = excluded.enable_tags,
@@ -1002,6 +1007,39 @@ mod tests {
         let row = s.get_session("a").unwrap().unwrap();
         assert_eq!(row.enable_tags, None);
         assert_eq!(row.disable_tags, None);
+    }
+
+    #[test]
+    fn cwd_is_pinned_to_first_event() {
+        let s = store();
+        // First event: launch directory /home/proj.
+        s.upsert_session(
+            "a",
+            Path::new("/home/proj"),
+            Path::new("/home/proj"),
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        // A later event after the session `cd`'d elsewhere.
+        s.upsert_session(
+            "a",
+            Path::new("/home/proj"),
+            Path::new("/home/proj/vendor/thing"),
+            None,
+            None,
+            None,
+            None,
+            200,
+        )
+        .unwrap();
+        let row = s.get_session("a").unwrap().unwrap();
+        // cwd stays the launch dir; last_activity still advances.
+        assert_eq!(row.cwd, PathBuf::from("/home/proj"));
+        assert_eq!(row.last_activity, 200);
     }
 
     #[test]

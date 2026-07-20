@@ -51,6 +51,26 @@ pub struct RunOutcome {
     pub fork_session_id: Option<String>,
 }
 
+/// Retries for the transcript-flush race: a session-end fork can spawn while
+/// the quitting parent is still finalizing a large transcript, so `--resume`
+/// can't find the conversation yet.
+const RESUME_RETRIES: u32 = 3;
+
+/// Base backoff (ms) between resume retries; doubles each attempt (2s, 4s, 8s
+/// by default). Overridable via `FORKSAN_RETRY_BASE_MS` (tests short-circuit
+/// the sleeps this way).
+fn retry_base_ms() -> u64 {
+    std::env::var("FORKSAN_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000)
+}
+
+/// The one error class worth retrying: the resume target isn't on disk yet.
+fn is_resume_not_ready(err: &str) -> bool {
+    err.contains("No conversation found")
+}
+
 /// The parsed shape of `claude -p --output-format json` stdout.
 #[derive(Debug, Default)]
 struct ClaudeResult {
@@ -183,56 +203,83 @@ pub async fn run_one_fork(
         &piped,
     );
 
-    let mut cmd = tokio::process::Command::new(&cfg.claude_bin);
-    cmd.arg("-p")
-        .arg("--resume")
-        .arg(&resume_target)
-        .arg("--fork-session")
-        .arg("--output-format")
-        .arg("json")
-        .arg("--setting-sources")
-        .arg("")
-        .arg("--strict-mcp-config")
-        .arg("--settings")
-        .arg(r#"{"disableAllHooks":true}"#)
-        .current_dir(cwd)
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env("DISABLE_AUTOUPDATER", "1")
-        .env("DISABLE_TELEMETRY", "1")
-        .env("DISABLE_ERROR_REPORTING", "1")
-        // The parent session's identity, so a fork can key per-session state
-        // on disk deterministically (cwd alone is not unique).
-        .env("FORKSAN_SESSION_ID", session_id)
-        .env("FORKSAN_FORK_NAME", &sel.name)
-        .env("FORKSAN_TRIGGER", &sel.trigger)
-        .env("FORKSAN_PROJECT_ROOT", project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    if let Some(model) = &sel.def.model {
-        cmd.arg("--model").arg(model);
-    }
-    // Fork permissions: a headless fork can't answer prompts, so grant it the
-    // rules it needs up front. `--allowedTools` is variadic (flag + entries).
-    if !sel.def.allowed_tools.is_empty() {
-        cmd.arg("--allowedTools").args(&sel.def.allowed_tools);
-    }
-    // Permission mode: the fork's own value wins, else the config default.
-    if let Some(mode) = sel
-        .def
-        .permission_mode
-        .as_deref()
-        .or(cfg.permission_mode.as_deref())
-    {
-        cmd.arg("--permission-mode").arg(mode);
-    }
+    // A fresh command per attempt (a retry consumes the previous one).
+    let build_cmd = || {
+        let mut cmd = tokio::process::Command::new(&cfg.claude_bin);
+        cmd.arg("-p")
+            .arg("--resume")
+            .arg(&resume_target)
+            .arg("--fork-session")
+            .arg("--output-format")
+            .arg("json")
+            .arg("--setting-sources")
+            .arg("")
+            .arg("--strict-mcp-config")
+            .arg("--settings")
+            .arg(r#"{"disableAllHooks":true}"#)
+            .current_dir(cwd)
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("DISABLE_TELEMETRY", "1")
+            .env("DISABLE_ERROR_REPORTING", "1")
+            // The parent session's identity, so a fork can key per-session
+            // state on disk deterministically (cwd alone is not unique).
+            .env("FORKSAN_SESSION_ID", session_id)
+            .env("FORKSAN_FORK_NAME", &sel.name)
+            .env("FORKSAN_TRIGGER", &sel.trigger)
+            .env("FORKSAN_PROJECT_ROOT", project_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        if let Some(model) = &sel.def.model {
+            cmd.arg("--model").arg(model);
+        }
+        // Fork permissions: a headless fork can't answer prompts, so grant it
+        // the rules it needs up front. `--allowedTools` is variadic.
+        if !sel.def.allowed_tools.is_empty() {
+            cmd.arg("--allowedTools").args(&sel.def.allowed_tools);
+        }
+        // Permission mode: the fork's own value wins, else the config default.
+        if let Some(mode) = sel
+            .def
+            .permission_mode
+            .as_deref()
+            .or(cfg.permission_mode.as_deref())
+        {
+            cmd.arg("--permission-mode").arg(mode);
+        }
+        cmd
+    };
 
     daemon
         .active_runs
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let result = run_subprocess(daemon, cfg, cmd, &prompt, spawned).await;
+    // A session-end fork can outrun the parent's transcript flush: the resume
+    // target isn't on disk yet and `claude` exits with "No conversation
+    // found". Retry just that error class, with backoff, while the parent
+    // finishes writing — one logical run throughout (the run row, tags, and
+    // started marker were already recorded once above).
+    let retry_base = retry_base_ms();
+    let mut attempt: u32 = 0;
+    let result = loop {
+        let r = run_subprocess(daemon, cfg, build_cmd(), &prompt, spawned.take()).await;
+        match &r {
+            Err(e) if is_resume_not_ready(e) && attempt < RESUME_RETRIES => {
+                let delay = retry_base.saturating_mul(1u64 << attempt);
+                tracing::info!(
+                    fork = %sel.name,
+                    attempt = attempt + 1,
+                    delay_ms = delay,
+                    "resume target not ready yet (No conversation found), retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            _ => break r,
+        }
+    };
     daemon
         .active_runs
         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
