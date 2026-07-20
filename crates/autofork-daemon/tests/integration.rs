@@ -839,3 +839,54 @@ fn list_forks_marks_only_marked_files_and_status_and_shutdown() {
         let _ = child.wait();
     }
 }
+
+#[test]
+fn prune_closes_stale_sessions_only() {
+    // 1s idle deadline → stale after >2s idle with no parked poll.
+    let mut h = Harness::new("1s", "0");
+    h.start_daemon();
+
+    // s1 will go stale: an event, then silence with no parked poll (its
+    // Claude process "died mid-turn").
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    // s3 idles just as long but keeps a parked poll → never stale.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s3")));
+    let parked = h.park_stop_wait(h.event(EventKind::Stop, "s3"));
+    std::thread::sleep(Duration::from_millis(3200));
+    // s2 is freshly active.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s2")));
+
+    let stale: Vec<String> = h
+        .open_sessions()
+        .into_iter()
+        .filter(|s| s.stale)
+        .map(|s| s.session_id)
+        .collect();
+    assert_eq!(stale, vec!["s1".to_string()], "status stale annotation");
+
+    match h.request(RequestBody::Prune) {
+        ResponseBody::Pruned { sessions } => {
+            assert_eq!(sessions.len(), 1, "pruned: {sessions:?}");
+            assert_eq!(sessions[0].session_id, "s1");
+            assert_eq!(sessions[0].status, "closed");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(!h.has_open_session("s1"), "stale session still open");
+    assert!(h.has_open_session("s2"), "active session was pruned");
+    assert!(h.has_open_session("s3"), "parked session was pruned");
+
+    // Idempotent: nothing left to prune.
+    match h.request(RequestBody::Prune) {
+        ResponseBody::Pruned { sessions } => assert!(sessions.is_empty(), "{sessions:?}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // A later event re-opens a pruned session via the normal upsert path.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert!(h.has_open_session("s1"), "event did not re-open");
+
+    // Unpark s3's poll so its thread ends cleanly.
+    assert_ack(h.send_event(h.prompt_submit("s3", true)));
+    let _ = parked.recv_timeout(Duration::from_secs(5));
+}

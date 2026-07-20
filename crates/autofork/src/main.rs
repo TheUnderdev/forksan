@@ -48,6 +48,12 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Close the sessions `status` marks [stale?] now.
+    ///
+    /// Stale = open with no parked poll and long idle — a Claude process that
+    /// died mid-turn. Harmless (a stale session can never fire a fork) but they
+    /// clutter `status` until the session timeout (default 12h) reaps them.
+    Prune,
     /// Check the installation and report problems.
     Doctor,
     /// Ask the daemon to exit (it restarts on the next hook event).
@@ -71,6 +77,7 @@ fn main() {
         Command::Forks { project } => exit_on_err(commands::list_forks(&paths, project)),
         Command::Run { name, tag } => exit_on_err(commands::run_fork(&paths, name, tag)),
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
+        Command::Prune => exit_on_err(commands::prune(&paths)),
         Command::Doctor => exit_on_err(commands::doctor(&paths)),
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }

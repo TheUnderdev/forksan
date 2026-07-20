@@ -32,6 +32,10 @@ pub enum RequestBody {
     Status,
     /// Discovered forks for a project (the `autofork forks` command).
     ListForks { project_root: PathBuf, cwd: PathBuf },
+    /// Close every stale session now (the `autofork prune` command), instead
+    /// of waiting for the session-timeout reaper. Stale = the same heuristic
+    /// `Status` annotates: open, no parked poll, idle far past the deadline.
+    Prune,
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
     Shutdown { drain: bool },
@@ -103,6 +107,10 @@ pub enum ResponseBody {
     StatusInfo(StatusInfo),
     ForkList {
         items: Vec<ForkInfo>,
+    },
+    /// The sessions a `Prune` closed (empty when nothing was stale).
+    Pruned {
+        sessions: Vec<SessionInfo>,
     },
     Error {
         code: ErrorCode,

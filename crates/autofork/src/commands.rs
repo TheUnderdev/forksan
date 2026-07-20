@@ -1,4 +1,4 @@
-//! User-facing commands: status, forks, run, logs, doctor.
+//! User-facing commands: status, forks, run, logs, prune, doctor.
 
 use crate::client::Client;
 use autofork_core::config::Paths;
@@ -140,6 +140,35 @@ pub fn status(paths: &Paths) -> Result<(), String> {
                 fmt_ago(t, r.started_at),
             );
         }
+    }
+    Ok(())
+}
+
+pub fn prune(paths: &Paths) -> Result<(), String> {
+    let mut client = connect(paths)?;
+    let ResponseBody::Pruned { sessions } = client
+        .request(RequestBody::Prune)
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("unexpected response".into());
+    };
+    if sessions.is_empty() {
+        println!("no stale sessions");
+        return Ok(());
+    }
+    let t = now();
+    println!(
+        "closed {} stale session{}:",
+        sessions.len(),
+        if sessions.len() == 1 { "" } else { "s" }
+    );
+    for s in &sessions {
+        println!(
+            "  session {} {} (last active {})",
+            &s.session_id[..s.session_id.len().min(8)],
+            s.project_root.display(),
+            fmt_ago(t, s.last_activity),
+        );
     }
     Ok(())
 }

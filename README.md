@@ -166,6 +166,7 @@ autofork forks           # forks visible from here, with warnings
 autofork run <name>      # print the spawn instruction to paste into an interactive session
 autofork run --tag <tag> # print instructions for every fork carrying <tag>
 autofork logs [-f]       # daemon log
+autofork prune           # close [stale?] sessions now instead of waiting for the session timeout
 autofork doctor          # install checks
 autofork stop-daemon     # retire the daemon (it restarts on the next event)
 ```
@@ -238,7 +239,9 @@ stamped at **wake-issuance** (when the daemon answers the poll), not at fork com
   opportunity is simply missed — the next turn re-arms it. A hook never wedges or errors a session.
 - A session whose Claude process dies (killed terminal, restart) is closed automatically: its parked
   poll drops, and after a short grace with no new event the daemon marks it closed. A stray open
-  session that crashed mid-turn shows a `[stale?]` hint in `autofork status`.
+  session that crashed mid-turn shows a `[stale?]` hint in `autofork status` — harmless (it can
+  never fire a fork), and reaped once idle past `session_timeout`; `autofork prune` closes such
+  sessions immediately.
 
 ## v0.4 → v0.5 migration
 

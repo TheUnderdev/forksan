@@ -171,6 +171,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                 .collect();
             ResponseBody::ForkList { items }
         }
+        RequestBody::Prune => prune(daemon),
         RequestBody::Shutdown { drain } => {
             tracing::info!(drain, "shutdown requested");
             let daemon = daemon.clone();
@@ -182,6 +183,17 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
     }
 }
 
+/// The `[stale?]` heuristic — cheap honesty for a mid-turn crash the poll-loss
+/// path can't see: open, no parked poll, and idle far past the deadline.
+fn is_stale(daemon: &Arc<Daemon>, s: &autofork_core::store::SessionRow, now: i64) -> bool {
+    let deadline = daemon
+        .cfg_for(Some(&s.project_root))
+        .default_idle_deadline_secs;
+    !daemon.is_parked(&s.session_id)
+        && deadline > 0
+        && (now - s.last_activity) > 2 * deadline as i64
+}
+
 fn status(daemon: &Arc<Daemon>) -> ResponseBody {
     let now = crate::daemon::now();
     let store = daemon.store.lock().unwrap();
@@ -190,14 +202,7 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
-            // Cheap honesty for a mid-turn crash the poll-loss path can't see:
-            // open, no parked poll, and idle far past the deadline.
-            let deadline = daemon
-                .cfg_for(Some(&s.project_root))
-                .default_idle_deadline_secs;
-            let stale = !daemon.is_parked(&s.session_id)
-                && deadline > 0
-                && (now - s.last_activity) > 2 * deadline as i64;
+            let stale = is_stale(daemon, &s, now);
             SessionInfo {
                 session_id: s.session_id,
                 project_root: s.project_root,
@@ -227,4 +232,30 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
         sessions,
         recent_runs,
     })
+}
+
+/// Close every session the `[stale?]` heuristic flags, right now, instead of
+/// waiting for the session-timeout reaper. Safe by construction: a stale
+/// session has no parked poll, so nothing is waiting on it — and if its Claude
+/// process is somehow still alive, the next hook event reopens it.
+fn prune(daemon: &Arc<Daemon>) -> ResponseBody {
+    let now = crate::daemon::now();
+    let store = daemon.store.lock().unwrap();
+    let mut sessions = Vec::new();
+    for s in store.list_open_sessions().unwrap_or_default() {
+        if !is_stale(daemon, &s, now) {
+            continue;
+        }
+        tracing::info!(session = %s.session_id, "pruning stale session");
+        let _ = store.close_session(&s.session_id);
+        sessions.push(SessionInfo {
+            session_id: s.session_id,
+            project_root: s.project_root,
+            status: "closed".to_string(),
+            last_activity: s.last_activity,
+            prompt_tokens: s.prompt_tokens,
+            stale: true,
+        });
+    }
+    ResponseBody::Pruned { sessions }
 }
