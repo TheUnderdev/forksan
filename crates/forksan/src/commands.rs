@@ -18,34 +18,55 @@ const FORK_DEFAULT_VERSION: [u64; 3] = [2, 1, 161];
 /// `CLAUDE_CODE_FORK_SUBAGENT=1` until [`FORK_DEFAULT_VERSION`]).
 const FORK_GATED_VERSION: [u64; 3] = [2, 1, 117];
 
-/// The doctor hint printed for a fork-capable version: whether the explicit
-/// enable env is set, plus how to pin it against Claude Code's dynamic agent
-/// disclosure (a wake reporting "'fork' not found" on a current version is
-/// disclosure-gating, not a version problem).
-fn fork_disclosure_hint() -> Vec<String> {
-    fork_disclosure_hint_lines(std::env::var_os("CLAUDE_CODE_FORK_SUBAGENT").is_some())
+/// The doctor hint printed for a fork-capable version: whether the force-enable
+/// env is set, plus the confirmed remedy for a current version that still lacks
+/// the fork type because of the staged server-side rollout.
+fn fork_enable_hint() -> Vec<String> {
+    fork_enable_hint_lines(std::env::var_os("CLAUDE_CODE_FORK_SUBAGENT").is_some())
 }
 
-fn fork_disclosure_hint_lines(env_set: bool) -> Vec<String> {
+fn fork_enable_hint_lines(env_set: bool) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(if env_set {
-        "        CLAUDE_CODE_FORK_SUBAGENT is set (explicit fork-subagent enable)".to_string()
+        "        CLAUDE_CODE_FORK_SUBAGENT is set (fork subagent force-enabled)".to_string()
     } else {
         "        note: CLAUDE_CODE_FORK_SUBAGENT is not set".to_string()
     });
     lines.push(
-        "        if a wake reports \"Agent type 'fork' not found\" on this version, Claude Code is"
+        "        a current version can still lack the fork type due to a staged server-side"
             .to_string(),
     );
     lines.push(
-        "        disclosing agent types dynamically — pin the fork type by adding".to_string(),
-    );
-    lines.push(
-        "        {\"env\": {\"CLAUDE_CODE_FORK_SUBAGENT\": \"1\"}} to ~/.claude/settings.json"
+        "        rollout; force-enable it by adding {\"env\": {\"CLAUDE_CODE_FORK_SUBAGENT\": \"1\"}}"
             .to_string(),
     );
-    lines.push("        (best-effort — the disclosure interaction is undocumented)".to_string());
+    lines.push(
+        "        to ~/.claude/settings.json (persistent; preferred over a shell export)"
+            .to_string(),
+    );
     lines
+}
+
+/// Impostor `fork` agent definitions: a custom `fork.md` under `.claude/agents/`
+/// (user-level and/or project-level) shadows the built-in fork subagent type
+/// but does NOT inherit the conversation, so forks would silently lose context.
+/// Returns the existing offenders.
+fn impostor_agent_files(
+    home: Option<&std::path::Path>,
+    project_root: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(h) = home {
+        let p = h.join(".claude/agents/fork.md");
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    let p = project_root.join(".claude/agents/fork.md");
+    if p.is_file() && !out.contains(&p) {
+        out.push(p);
+    }
+    out
 }
 
 /// Extract the first `x.y.z` triple from `claude --version` output (which may
@@ -329,7 +350,7 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
             match parse_version(raw) {
                 Some(v) if v >= FORK_DEFAULT_VERSION => {
                     ok(&format!("claude: {raw}"));
-                    for line in fork_disclosure_hint() {
+                    for line in fork_enable_hint() {
                         println!("{line}");
                     }
                 }
@@ -348,6 +369,23 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
             }
         }
         _ => println!("  note: could not run 'claude --version' to check fork subagent support"),
+    }
+
+    // Impostor `fork` agent definitions (a context-less shadow of the built-in
+    // type — see the wake payload's own prohibition against creating one).
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let proot = std::env::current_dir()
+        .ok()
+        .map(|c| project_root(&c))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    for f in impostor_agent_files(home.as_deref(), &proot) {
+        problems += 1;
+        println!(
+            "  PROBLEM: custom agent 'fork' at {} shadows/impersonates the",
+            f.display()
+        );
+        println!("           built-in fork subagent type — forksan forks would silently lose");
+        println!("           conversation context; delete it.");
     }
 
     println!(
@@ -385,16 +423,41 @@ mod tests {
     }
 
     #[test]
-    fn fork_disclosure_hint_reflects_env_and_recommends_pin() {
-        let set = fork_disclosure_hint_lines(true).join("\n");
+    fn fork_enable_hint_reflects_env_and_recommends_settings_pin() {
+        let set = fork_enable_hint_lines(true).join("\n");
         assert!(set.contains("CLAUDE_CODE_FORK_SUBAGENT is set"));
-        assert!(set.contains("~/.claude/settings.json"));
-        assert!(set.contains("best-effort"));
+        assert!(set.contains("force-enabled"));
 
-        let unset = fork_disclosure_hint_lines(false).join("\n");
+        let unset = fork_enable_hint_lines(false).join("\n");
         assert!(unset.contains("CLAUDE_CODE_FORK_SUBAGENT is not set"));
-        assert!(unset.contains("Agent type 'fork' not found"));
-        assert!(unset.contains("disclosing agent types dynamically"));
+        assert!(unset.contains("staged server-side"));
         assert!(unset.contains(r#"{"env": {"CLAUDE_CODE_FORK_SUBAGENT": "1"}}"#));
+        assert!(unset.contains("~/.claude/settings.json"));
+    }
+
+    #[test]
+    fn detects_impostor_fork_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".forksan")).unwrap();
+
+        // Nothing yet.
+        assert!(impostor_agent_files(Some(&home), &project).is_empty());
+
+        // A user-level impostor.
+        std::fs::create_dir_all(home.join(".claude/agents")).unwrap();
+        std::fs::write(home.join(".claude/agents/fork.md"), "impostor").unwrap();
+        let found = impostor_agent_files(Some(&home), &project);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with(".claude/agents/fork.md"));
+
+        // Plus a project-level impostor → both reported.
+        std::fs::create_dir_all(project.join(".claude/agents")).unwrap();
+        std::fs::write(project.join(".claude/agents/fork.md"), "impostor").unwrap();
+        assert_eq!(impostor_agent_files(Some(&home), &project).len(), 2);
+
+        // Same dir as home and project (dedup): no double-count.
+        assert_eq!(impostor_agent_files(Some(&project), &project).len(), 1);
     }
 }

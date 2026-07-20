@@ -44,26 +44,29 @@ interactive sessions:
 
 `forksan doctor` checks your `claude --version` against these thresholds.
 
-### Dynamic agent disclosure
+### If wakes report the fork type unavailable
 
-Even on a current version a wake can report **`Agent type 'fork' not found`**. Newer Claude Code
-builds disclose agent types *dynamically* — the Agent tool's roster is derived from the user's own
-prompt (RAG-style, matched against agent descriptions), and forksan's hook-injected wake reminder
-doesn't reliably trigger that disclosure. When it happens the wake safely recovers instead of
-substituting a wrong agent: the model retries the fork call once, and if the `fork` type still isn't
-disclosed it tells you the type isn't loaded this turn and that **any next message will let the forks
-spawn** — your next organic prompt discloses `fork`, and the pending spawn instructions (still in
-context) then succeed.
-
-To reduce this on a machine where wakes keep reporting the type unavailable despite a current
-version, add an explicit enable to `~/.claude/settings.json`:
+Even on a fully current version a wake can report **`Agent type 'fork' not found`** — the fork
+subagent ships behind a **staged server-side rollout**. The confirmed fix is to force-enable it
+persistently in `~/.claude/settings.json`:
 
 ```json
 { "env": { "CLAUDE_CODE_FORK_SUBAGENT": "1" } }
 ```
 
-This is **best-effort** — it pins the flag against staged rollout, but the disclosure interaction
-itself is undocumented, so the say-anything recovery above remains the reliable fallback.
+(Prefer this over a shell `export` so every session gets it.) As a safety net, each wake also tells
+the model to retry the fork call once and, if it still fails, to hold the spawn instructions and run
+them on your next message rather than substituting a wrong agent — so a transient miss self-corrects
+even without the pin. (Deferred agent rosters that key off the user's prompt are plausible and were
+briefly suspected here, but the evidence was confounded — see below — so the env pin, not any
+disclosure mechanism, is the remedy.)
+
+> **Never let a wake create a `fork` agent file.** If the fork type is missing, the correct fix is
+> the env pin above — *not* a custom `~/.claude/agents/fork.md`. A custom agent named `fork` does not
+> inherit the conversation (only the built-in type does) and shadows the real one, so its "report"
+> will show no knowledge of your session. Wakes are instructed never to create one; if you suspect an
+> impostor slipped in (a fork "ran" but its report is context-blind), run `forksan doctor` — it flags
+> `fork.md` under `.claude/agents/`. Delete it.
 
 ## Install
 

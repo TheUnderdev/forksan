@@ -132,10 +132,13 @@ pub fn build_wake_payload(session_id: &str, project_root: &str, forks: &[DueFork
 const CONTINGENCY: &str = " If the Agent tool reports \"Agent type 'fork' not found\" (or that \
     the 'fork' agent type is unavailable), first retry the exact same Agent call once. If it \
     still fails, do NOT substitute another agent type (other agents don't inherit this \
-    conversation and cannot do a fork's job) — instead reply with one line telling the user \
-    the fork agent type isn't loaded in this turn (Claude Code discloses it dynamically) and \
-    that sending any next message will let the forks spawn. When the user next messages, spawn \
-    the due forks listed above before doing anything else.";
+    conversation and cannot do a fork's job). Never create, install, or edit any agent \
+    definition (e.g. a file named fork.md under .claude/agents/) to work around a missing \
+    fork type — a custom agent cannot inherit this conversation and cannot do a fork's job, \
+    and a custom agent named 'fork' shadows the real built-in type. Instead reply with one \
+    line telling the user the fork agent type isn't loaded in this turn and that sending any \
+    next message will let the forks spawn. When the user next messages, spawn the due forks \
+    listed above before doing anything else.";
 
 #[cfg(test)]
 mod tests {
@@ -198,8 +201,11 @@ mod tests {
         assert!(p.contains("retry the exact same Agent call once"));
         assert!(p.contains("sending any next message will let the forks spawn"));
         assert!(p.contains("spawn the due forks listed above before doing anything else"));
-        // Never substitute another agent type.
+        // Never substitute another agent type, and never fabricate an impostor.
         assert!(p.contains("do NOT substitute another agent type"));
+        assert!(p.contains("Never create, install, or edit any agent definition"));
+        assert!(p.contains(".claude/agents/"));
+        assert!(p.contains("shadows the real built-in type"));
     }
 
     #[test]
