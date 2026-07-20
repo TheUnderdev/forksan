@@ -3,7 +3,7 @@
 //! Pipeline (order matters): refresh discovery → queue
 //! roster → live re-read each rostered fork → tag filter (per-session
 //! enable/disable, falling back to config) → match moments → skip-ran-after
-//! guard (boot sweep) → throttle → context/boot latch → dependency
+//! guard (boot sweep) → throttle → per-tag throttle → context/boot latch → dependency
 //! resolution → execution (a readiness-counted DAG: each fork runs once all
 //! its `after` dependencies finished, receiving their reports; the first
 //! root runs alone for provider cache warming, the rest under the
@@ -100,6 +100,31 @@ pub async fn run_moments(
         if let (Some(throttle), Some(ran_at)) = (parsed.def.throttle_secs, entry.ran_at) {
             if (t - ran_at).max(0) < throttle as i64 {
                 tracing::debug!(fork = %entry.fork_name, "throttled, skipping");
+                continue;
+            }
+        }
+        // Per-tag shared throttle: a run of any fork carrying a throttled tag
+        // suppresses every fork sharing that tag until the window passes
+        // (project scope, like the per-fork throttle's last run).
+        if !parsed.def.tags.is_empty() && !cfg.tag_throttles.is_empty() {
+            let store = daemon.store.lock().unwrap();
+            let mut hit = None;
+            for tag in &parsed.def.tags {
+                let Some(&window) = cfg.tag_throttles.get(tag) else {
+                    continue;
+                };
+                if let Ok(Some(last)) =
+                    store.last_run_for_tags(&session.project_root, std::slice::from_ref(tag))
+                {
+                    if (t - last).max(0) < window as i64 {
+                        hit = Some(tag.clone());
+                        break;
+                    }
+                }
+            }
+            drop(store);
+            if let Some(tag) = hit {
+                tracing::debug!(fork = %entry.fork_name, %tag, "tag-throttled, skipping");
                 continue;
             }
         }

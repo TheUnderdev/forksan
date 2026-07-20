@@ -14,7 +14,7 @@ use crate::{truncate_chars, REPORT_MAX_CHARS};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`; a stored value always yields a
@@ -180,6 +180,15 @@ impl Store {
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN enable_tags TEXT;
                  ALTER TABLE sessions ADD COLUMN disable_tags TEXT;
+                 COMMIT;",
+            )?;
+        }
+        if version < 3 {
+            // A run records the tags of the fork it ran (comma-joined; NULL =
+            // untagged) so per-tag throttles can find the last run per tag.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE fork_runs ADD COLUMN tags TEXT;
                  COMMIT;",
             )?;
         }
@@ -420,14 +429,48 @@ impl Store {
         session_id: &str,
         fork_name: &str,
         trigger_label: &str,
+        tags: Option<&str>,
         now: i64,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO fork_runs (session_id, fork_name, trigger_label, state, started_at)
-             VALUES (?1, ?2, ?3, 'running', ?4)",
-            params![session_id, fork_name, trigger_label, now],
+            "INSERT INTO fork_runs (session_id, fork_name, trigger_label, state, started_at, tags)
+             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            params![session_id, fork_name, trigger_label, now, tags],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The most recent run start (across the project) of any fork carrying
+    /// one of `tags`, for per-tag throttling. `None` when no such run exists.
+    pub fn last_run_for_tags(
+        &self,
+        project_root: &Path,
+        tags: &[String],
+    ) -> rusqlite::Result<Option<i64>> {
+        if tags.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT r.started_at, r.tags FROM fork_runs r
+             JOIN sessions s ON s.session_id = r.session_id
+             WHERE s.project_root = ?1 AND r.tags IS NOT NULL
+             ORDER BY r.started_at DESC",
+        )?;
+        let mut rows = stmt.query(params![project_root.to_string_lossy()])?;
+        // Rows are newest-first, so the first tag match is the latest run.
+        while let Some(row) = rows.next()? {
+            let started_at: i64 = row.get(0)?;
+            let row_tags: String = row.get(1)?;
+            let hit = row_tags
+                .split(',')
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .any(|rt| tags.iter().any(|t| t == rt));
+            if hit {
+                return Ok(Some(started_at));
+            }
+        }
+        Ok(None)
     }
 
     pub fn finish_run(
@@ -772,7 +815,7 @@ mod tests {
     fn started_collapses_when_response_pending() {
         let s = store();
         seed_session(&s, "a", "/p", 100);
-        let run = s.insert_run("a", "f", "idle", 100).unwrap();
+        let run = s.insert_run("a", "f", "idle", None, 100).unwrap();
         s.insert_report(
             Some(run),
             "a",
@@ -785,7 +828,7 @@ mod tests {
         )
         .unwrap();
         // Another run still in flight: its started marker must survive.
-        let run2 = s.insert_run("a", "g", "idle", 100).unwrap();
+        let run2 = s.insert_run("a", "g", "idle", None, 100).unwrap();
         s.insert_report(
             Some(run2),
             "a",
@@ -905,7 +948,7 @@ mod tests {
     fn runs_lifecycle_and_stale_marking() {
         let s = store();
         seed_session(&s, "a", "/p", 100);
-        let id = s.insert_run("a", "f", "idle", 100).unwrap();
+        let id = s.insert_run("a", "f", "idle", None, 100).unwrap();
         assert_eq!(s.list_runs(&["running"], 10).unwrap().len(), 1);
         s.finish_run(id, "done", Some("fork-sid"), Some(0.01), None, 150)
             .unwrap();
@@ -913,7 +956,7 @@ mod tests {
         let done = s.list_runs(&["done"], 10).unwrap();
         assert_eq!(done[0].fork_session_id.as_deref(), Some("fork-sid"));
 
-        let id2 = s.insert_run("a", "g", "idle", 160).unwrap();
+        let id2 = s.insert_run("a", "g", "idle", None, 160).unwrap();
         let _ = id2;
         assert_eq!(s.mark_stale_runs_interrupted(200).unwrap(), 1);
         assert_eq!(s.list_runs(&["interrupted"], 10).unwrap().len(), 1);
@@ -959,6 +1002,59 @@ mod tests {
         let row = s.get_session("a").unwrap().unwrap();
         assert_eq!(row.enable_tags, None);
         assert_eq!(row.disable_tags, None);
+    }
+
+    #[test]
+    fn last_run_for_tags_finds_latest_across_project() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        seed_session(&s, "b", "/q", 100);
+
+        // No tagged runs yet.
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
+                .unwrap(),
+            None
+        );
+
+        // A ci run in project /p at t=110, then a review run at t=120.
+        s.insert_run("a", "f", "manual", Some("ci,build"), 110)
+            .unwrap();
+        s.insert_run("a", "g", "manual", Some("review"), 120)
+            .unwrap();
+        // Untagged runs never count.
+        s.insert_run("a", "h", "manual", None, 130).unwrap();
+
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
+                .unwrap(),
+            Some(110)
+        );
+        // Comma-boundary matching: "build" hits, "bui" must not.
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["build".to_string()])
+                .unwrap(),
+            Some(110)
+        );
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["bui".to_string()])
+                .unwrap(),
+            None
+        );
+        // Multiple tags: the newest matching run wins.
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string(), "review".to_string()])
+                .unwrap(),
+            Some(120)
+        );
+        // Project scoping: /q sees nothing.
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/q"), &["ci".to_string()])
+                .unwrap(),
+            None
+        );
+        // Empty tag list is a no-op.
+        assert_eq!(s.last_run_for_tags(Path::new("/p"), &[]).unwrap(), None);
     }
 
     #[test]

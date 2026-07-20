@@ -82,6 +82,14 @@ impl Harness {
         }
     }
 
+    fn append_config(&self, extra: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.home.join("config.toml"))
+            .unwrap();
+        writeln!(f, "{extra}").unwrap();
+    }
+
     fn write_fork(&self, rel: &str, content: &str) {
         let path = self.project.join(".forksan/forks").join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -333,6 +341,107 @@ fn enable_list_excludes_untagged_fork() {
     assert!(
         h.stub_prompts().iter().all(|p| !p.contains("PLAIN WORK")),
         "untagged fork ran despite an enable whitelist"
+    );
+}
+
+#[test]
+fn run_by_tag_fires_all_matching_forks() {
+    // Long idle so nothing auto-fires; only the manual tag run does.
+    let mut h = Harness::new("1h");
+    h.write_fork("a.md", "---\nrun_on: [idle]\ntags: [ci]\n---\nA WORK");
+    h.write_fork("b.md", "---\nrun_on: [idle]\ntags: [ci]\n---\nB WORK");
+    h.write_fork("c.md", "---\nrun_on: [idle]\ntags: [docs]\n---\nC WORK");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    match h.request(RequestBody::RunFork {
+        name: None,
+        project_root: h.project.clone(),
+        cwd: h.project.clone(),
+        session_id: None,
+        tag: Some("ci".into()),
+    }) {
+        ResponseBody::RunStartedMany { mut forks, .. } => {
+            forks.sort();
+            assert_eq!(forks, vec!["a".to_string(), "b".to_string()]);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Both ci-tagged forks run; the docs-tagged fork is untouched.
+    let start = Instant::now();
+    loop {
+        let prompts = h.stub_prompts();
+        if prompts.iter().any(|p| p.contains("A WORK"))
+            && prompts.iter().any(|p| p.contains("B WORK"))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "tagged forks never ran: {prompts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        h.stub_prompts().iter().all(|p| !p.contains("C WORK")),
+        "non-matching fork ran on a tag run"
+    );
+
+    // An unknown tag is an error, not a silent no-op.
+    match h.request(RequestBody::RunFork {
+        name: None,
+        project_root: h.project.clone(),
+        cwd: h.project.clone(),
+        session_id: None,
+        tag: Some("nope".into()),
+    }) {
+        ResponseBody::Error { message, .. } => {
+            assert!(message.contains("no forks with tag 'nope'"), "{message}");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn tag_throttle_suppresses_group_but_other_tag_runs() {
+    let mut h = Harness::new("1s");
+    h.append_config("[tag_throttles]\nci = \"1h\"");
+    h.write_fork(
+        "a.md",
+        "---\nrun_on: [session_start]\ntags: [ci]\n---\nA WORK",
+    );
+    h.write_fork("b.md", "---\nrun_on: [idle]\ntags: [ci]\n---\nB WORK");
+    h.write_fork("c.md", "---\nrun_on: [idle]\ntags: [docs]\n---\nC WORK");
+    h.start_daemon();
+
+    // forkA fires on session_start and stamps a `ci` run.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    let start = Instant::now();
+    while !h.stub_prompts().iter().any(|p| p.contains("A WORK")) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "session_start fork never ran"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Arm the 1s idle clock; forkC (docs) runs, forkB (ci) is tag-throttled.
+    assert_ack(h.send_event(h.event(EventKind::Stop, "s1")));
+    let start = Instant::now();
+    while !h.stub_prompts().iter().any(|p| p.contains("C WORK")) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "differently-tagged fork never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        h.stub_prompts().iter().all(|p| !p.contains("B WORK")),
+        "same-tag fork ran despite the tag throttle"
     );
 }
 

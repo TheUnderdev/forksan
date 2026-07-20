@@ -126,6 +126,7 @@ Claude Code ──hooks──▶ forksan (CLI) ──unix socket──▶ forksa
 forksan status          # daemon, sessions, running forks, recent runs + costs
 forksan forks           # forks visible from here, with warnings
 forksan run <name>      # fire a fork manually against the current session
+forksan run --tag <tag> # fire every fork carrying <tag> (bulk manual run)
 forksan logs [-f]       # daemon log
 forksan doctor          # install checks; --gc-fork-sessions 30d prunes old fork transcripts
 forksan stop-daemon     # retire the daemon (it restarts on the next event)
@@ -174,7 +175,24 @@ Two sources feed the filter, per key:
   layer over home layer). A session's env value overrides the config default for
   that key.
 
-Manual runs (`forksan run <name>`) deliberately bypass the filter.
+Manual runs (`forksan run <name>` and `forksan run --tag <tag>`) deliberately bypass the
+filter.
+
+### Per-tag throttles
+
+`[tag_throttles]` maps a tag to a minimum gap between runs of **any** fork carrying that
+tag — one shared budget for the whole group. A single run of any fork with the tag suppresses
+every other fork sharing it until the window passes:
+
+```toml
+[tag_throttles]
+ci = "1h"        # at most one run per hour across all forks tagged `ci`
+review = "30m"
+```
+
+It composes with a fork's own `throttle` (both must pass), layers per key like `[models]`
+(project entries override home), and — like the per-fork throttle — simply skips a suppressed
+fork, which recurs at its next moment. Manual `forksan run` bypasses tag throttles.
 
 ## Costs, caveats
 

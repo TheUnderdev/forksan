@@ -108,7 +108,8 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             project_root,
             cwd,
             session_id,
-        } => run_fork_manually(daemon, name, project_root, cwd, session_id).await,
+            tag,
+        } => run_fork_manually(daemon, name, tag, project_root, cwd, session_id).await,
         RequestBody::Status => status(daemon),
         RequestBody::ListForks {
             project_root: _,
@@ -154,9 +155,13 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
     }
 }
 
+/// Manually fire forks: one by `name`, or every fork carrying `tag`. Manual
+/// runs deliberately bypass the per-session tag filter and the per-tag
+/// throttles — the user asked for them explicitly.
 async fn run_fork_manually(
     daemon: &Arc<Daemon>,
-    name: String,
+    name: Option<String>,
+    tag: Option<String>,
     project_root: std::path::PathBuf,
     cwd: std::path::PathBuf,
     session_id: Option<String>,
@@ -176,34 +181,75 @@ async fn run_fork_manually(
     };
     let (entries, _) =
         forksan_core::discovery::discover_forks(&cwd, Some(&daemon.user_forks_root()));
-    let Some(entry) = entries.into_iter().find(|e| e.name == name) else {
-        return ResponseBody::Error {
-            code: ErrorCode::NotFound,
-            message: format!("no fork named '{name}' visible from {}", cwd.display()),
-        };
+
+    // Pick the forks to fire: one by name, or all carrying the given tag.
+    let picked: Vec<_> = match (&name, &tag) {
+        (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
+            Some(e) => vec![e],
+            None => {
+                return ResponseBody::Error {
+                    code: ErrorCode::NotFound,
+                    message: format!("no fork named '{name}' visible from {}", cwd.display()),
+                };
+            }
+        },
+        (None, Some(tag)) => {
+            let matched: Vec<_> = entries
+                .into_iter()
+                .filter(|e| e.parsed.def.tags.iter().any(|t| t == tag))
+                .collect();
+            if matched.is_empty() {
+                return ResponseBody::Error {
+                    code: ErrorCode::NotFound,
+                    message: format!("no forks with tag '{tag}' visible from {}", cwd.display()),
+                };
+            }
+            matched
+        }
+        (None, None) => {
+            return ResponseBody::Error {
+                code: ErrorCode::BadRequest,
+                message: "run requires a fork name or a tag".into(),
+            };
+        }
     };
-    let sel = SelectedFork {
-        name: entry.name.clone(),
-        path: entry.path.clone(),
-        def: entry.parsed.def.clone(),
-        body: entry.parsed.body.clone(),
-        trigger: "manual".into(),
-    };
+
     let cfg = daemon.cfg_for(Some(&session.project_root));
-    let daemon_ref = daemon.clone();
-    let sid = session.session_id.clone();
-    let proot = session.project_root.clone();
-    let scwd = session.cwd.clone();
-    {
-        let store = daemon.store.lock().unwrap();
-        let _ = store.queue_fork(&sid, &sel.name, &sel.path, now());
+    let mut started = Vec::new();
+    for entry in picked {
+        let sel = SelectedFork {
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            def: entry.parsed.def.clone(),
+            body: entry.parsed.body.clone(),
+            trigger: "manual".into(),
+        };
+        {
+            let store = daemon.store.lock().unwrap();
+            let _ = store.queue_fork(&session.session_id, &sel.name, &sel.path, now());
+        }
+        started.push(sel.name.clone());
+        let daemon_ref = daemon.clone();
+        let cfg = cfg.clone();
+        let sid = session.session_id.clone();
+        let proot = session.project_root.clone();
+        let scwd = session.cwd.clone();
+        tokio::spawn(async move {
+            crate::runner::run_one_fork(&daemon_ref, &cfg, &sid, &proot, &scwd, &sel, &[], None)
+                .await;
+        });
     }
-    tokio::spawn(async move {
-        crate::runner::run_one_fork(&daemon_ref, &cfg, &sid, &proot, &scwd, &sel, &[], None).await;
-    });
-    ResponseBody::RunStarted {
-        fork: name,
-        session_id: session.session_id,
+
+    if name.is_some() {
+        ResponseBody::RunStarted {
+            fork: started.into_iter().next().unwrap_or_default(),
+            session_id: session.session_id,
+        }
+    } else {
+        ResponseBody::RunStartedMany {
+            forks: started,
+            session_id: session.session_id,
+        }
     }
 }
 

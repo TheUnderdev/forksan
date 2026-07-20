@@ -125,10 +125,19 @@ pub async fn run_one_fork(
     let now = crate::daemon::now();
     let deliver = sel.def.delivery != ForkDelivery::Discard;
 
+    // The run records its fork's tags (comma-joined) so per-tag throttles can
+    // find the last run per tag.
+    let tags_joined = (!sel.def.tags.is_empty()).then(|| sel.def.tags.join(","));
     let run_id = {
         let store = daemon.store.lock().unwrap();
         let run_id = store
-            .insert_run(session_id, &sel.name, &sel.trigger, now)
+            .insert_run(
+                session_id,
+                &sel.name,
+                &sel.trigger,
+                tags_joined.as_deref(),
+                now,
+            )
             .ok()?;
         let _ = store.touch_fork_ran(session_id, &sel.name, now);
         if deliver {

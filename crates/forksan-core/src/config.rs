@@ -37,6 +37,9 @@ pub struct Config {
     /// Default disable (blocklist) tag filter; a session's own filter
     /// overrides it. `None` = unset.
     pub disable_tags: Option<Vec<String>>,
+    /// Per-tag shared throttle (seconds): a minimum gap between runs of any
+    /// fork carrying that tag, across the project.
+    pub tag_throttles: BTreeMap<String, u64>,
 }
 
 impl Default for Config {
@@ -54,6 +57,7 @@ impl Default for Config {
             poll_budget_chars: 24_000,
             enable_tags: None,
             disable_tags: None,
+            tag_throttles: BTreeMap::new(),
         }
     }
 }
@@ -83,6 +87,8 @@ struct RawConfig {
     poll_budget_chars: Option<usize>,
     enable_tags: Option<Vec<String>>,
     disable_tags: Option<Vec<String>>,
+    #[serde(default)]
+    tag_throttles: BTreeMap<String, toml::Value>,
 }
 
 /// Keys ignored at project level (global-only concerns).
@@ -146,6 +152,14 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     }
     if let Some(v) = raw.disable_tags {
         cfg.disable_tags = Some(v);
+    }
+    // Like `models`: per-key extend so a project layer overrides the home
+    // layer for the tags it names and inherits the rest.
+    for (tag, v) in raw.tag_throttles {
+        let key = format!("tag_throttles.{tag}");
+        if let Some(secs) = parse_toml_duration(&v, &key, warnings) {
+            cfg.tag_throttles.insert(tag, secs);
+        }
     }
 }
 
@@ -348,6 +362,32 @@ mod tests {
         let (cfg, _) = load_config(None, Some(&home));
         assert_eq!(cfg.enable_tags, Some(vec!["home".to_string()]));
         assert_eq!(cfg.disable_tags, Some(vec!["noisy".to_string()]));
+    }
+
+    #[test]
+    fn tag_throttles_layer_per_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "[tag_throttles]\nci = \"1h\"\nreview = \"30m\"\n",
+        )
+        .unwrap();
+        // Project overrides `ci`, adds `docs`, and inherits `review`.
+        fs::write(
+            proj.join(".forksan/config.toml"),
+            "[tag_throttles]\nci = 120\ndocs = \"10m\"\n",
+        )
+        .unwrap();
+
+        let (cfg, warnings) = load_config(Some(&proj), Some(&home));
+        assert_eq!(cfg.tag_throttles.get("ci"), Some(&120));
+        assert_eq!(cfg.tag_throttles.get("review"), Some(&1800));
+        assert_eq!(cfg.tag_throttles.get("docs"), Some(&600));
+        assert!(warnings.is_empty());
     }
 
     #[test]

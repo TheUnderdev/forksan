@@ -29,13 +29,18 @@ pub enum RequestBody {
         project_root: PathBuf,
         budget_chars: usize,
     },
-    /// Manually fire one fork (the `forksan run` command).
+    /// Manually fire forks (the `forksan run` command): one by `name`, or
+    /// every fork carrying `tag`. Exactly one of the two is set.
     RunFork {
-        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         project_root: PathBuf,
         cwd: PathBuf,
         /// Target session; defaults to the project's most recent open one.
         session_id: Option<String>,
+        /// Run every fork whose `tags` contain this tag (instead of `name`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
     },
     /// Daemon + session + run status (the `forksan status` command).
     Status,
@@ -112,12 +117,29 @@ pub struct Response {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseBody {
     Ack,
-    HelloInfo { version: String },
-    Reports { items: Vec<ReportItem> },
+    HelloInfo {
+        version: String,
+    },
+    Reports {
+        items: Vec<ReportItem>,
+    },
     StatusInfo(StatusInfo),
-    ForkList { items: Vec<ForkInfo> },
-    RunStarted { fork: String, session_id: String },
-    Error { code: ErrorCode, message: String },
+    ForkList {
+        items: Vec<ForkInfo>,
+    },
+    RunStarted {
+        fork: String,
+        session_id: String,
+    },
+    /// One or more forks started by a `forksan run --tag` bulk run.
+    RunStartedMany {
+        forks: Vec<String>,
+        session_id: String,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -32,10 +32,14 @@ enum Command {
         #[arg(long)]
         project: Option<std::path::PathBuf>,
     },
-    /// Manually fire one fork against the project's current session.
+    /// Manually fire forks against the project's current session: one by
+    /// name, or every fork carrying `--tag`.
     Run {
-        /// Fork name.
-        name: String,
+        /// Fork name (omit when using --tag).
+        name: Option<String>,
+        /// Run every fork carrying this tag instead of one by name.
+        #[arg(long, conflicts_with = "name")]
+        tag: Option<String>,
         /// Target session id (defaults to the project's most recent open one).
         #[arg(long)]
         session: Option<String>,
@@ -72,7 +76,9 @@ fn main() {
         Command::Hook { event } => hook::run_hook(event),
         Command::Status => exit_on_err(commands::status(&paths)),
         Command::Forks { project } => exit_on_err(commands::list_forks(&paths, project)),
-        Command::Run { name, session } => exit_on_err(commands::run_fork(&paths, name, session)),
+        Command::Run { name, tag, session } => {
+            exit_on_err(commands::run_fork(&paths, name, tag, session))
+        }
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
         Command::Doctor { gc_fork_sessions } => {
             exit_on_err(commands::doctor(&paths, gc_fork_sessions))

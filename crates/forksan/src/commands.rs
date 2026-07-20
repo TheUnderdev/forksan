@@ -140,7 +140,15 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
     Ok(())
 }
 
-pub fn run_fork(paths: &Paths, name: String, session: Option<String>) -> Result<(), String> {
+pub fn run_fork(
+    paths: &Paths,
+    name: Option<String>,
+    tag: Option<String>,
+    session: Option<String>,
+) -> Result<(), String> {
+    if name.is_none() && tag.is_none() {
+        return Err("provide a fork name or --tag <tag>".into());
+    }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = project_root(&cwd);
     let mut client = connect(paths)?;
@@ -150,12 +158,22 @@ pub fn run_fork(paths: &Paths, name: String, session: Option<String>) -> Result<
             project_root: root,
             cwd,
             session_id: session,
+            tag,
         })
         .map_err(|e| e.to_string())?
     {
         ResponseBody::RunStarted { fork, session_id } => {
             println!("fork '{fork}' started against session {session_id}");
             println!("watch it with: forksan status");
+            Ok(())
+        }
+        ResponseBody::RunStartedMany { forks, session_id } => {
+            println!(
+                "started {} fork(s) against session {session_id}: {}",
+                forks.len(),
+                forks.join(", ")
+            );
+            println!("watch them with: forksan status");
             Ok(())
         }
         ResponseBody::Error { message, .. } => Err(message),
