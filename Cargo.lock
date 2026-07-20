@@ -189,7 +189,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "forksan"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "clap",
  "forksan-core",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "forksan-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "forksan-daemon"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "forksan-core",
  "libc",
