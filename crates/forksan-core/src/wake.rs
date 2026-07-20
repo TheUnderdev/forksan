@@ -43,11 +43,18 @@ pub struct DueFork {
     pub after: Vec<String>,
 }
 
-fn spawn_prompt(fork: &DueFork, session_id: &str, project_root: &str) -> String {
+fn spawn_prompt(
+    fork: &DueFork,
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+) -> String {
     format!(
         "Read the file {path} and follow the instructions in its body. Context for this \
-         run: fork '{name}', trigger '{trigger}', parent session {session_id}, project root \
-         {project_root}. Your final message is your report.",
+         run: fork '{name}', trigger '{trigger}', parent session {session_id}, conversation \
+         {conversation_id}, project root {project_root}. The conversation id is stable when \
+         a session is resumed (a resumed session gets a fresh session id); key any \
+         per-conversation artifacts on it. Your final message is your report.",
         path = fork.path,
         name = fork.name,
         trigger = fork.trigger,
@@ -63,7 +70,12 @@ fn overlap_line(fork: &DueFork) -> &'static str {
     }
 }
 
-fn root_block(fork: &DueFork, session_id: &str, project_root: &str) -> String {
+fn root_block(
+    fork: &DueFork,
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+) -> String {
     format!(
         "---\nsource: forksan\ndue: {name} (trigger: {trigger})\n---\n\
          Spawn a background fork subagent now: use the Agent tool with subagent_type \"fork\" \
@@ -71,12 +83,17 @@ fn root_block(fork: &DueFork, session_id: &str, project_root: &str) -> String {
          it.{overlap}",
         name = fork.name,
         trigger = fork.trigger,
-        prompt = spawn_prompt(fork, session_id, project_root),
+        prompt = spawn_prompt(fork, session_id, conversation_id, project_root),
         overlap = overlap_line(fork),
     )
 }
 
-fn dependent_block(fork: &DueFork, session_id: &str, project_root: &str) -> String {
+fn dependent_block(
+    fork: &DueFork,
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+) -> String {
     let preds = fork
         .after
         .iter()
@@ -93,7 +110,7 @@ fn dependent_block(fork: &DueFork, session_id: &str, project_root: &str) -> Stri
          it.{overlap}",
         name = fork.name,
         trigger = fork.trigger,
-        prompt = spawn_prompt(fork, session_id, project_root),
+        prompt = spawn_prompt(fork, session_id, conversation_id, project_root),
         overlap = overlap_line(fork),
     )
 }
@@ -102,13 +119,28 @@ fn dependent_block(fork: &DueFork, session_id: &str, project_root: &str) -> Stri
 /// within the set) come first as immediate spawn blocks; dependents follow as
 /// deferred spawn instructions. A trailing line asks the model to acknowledge
 /// the background work so the harness doesn't nudge about missing output.
-pub fn build_wake_payload(session_id: &str, project_root: &str, forks: &[DueFork]) -> String {
+///
+/// `conversation_id` is the identity that survives session resume (the
+/// transcript file stem — resumed legs get a fresh session id but append to
+/// the original transcript). Forks keying persistent artifacts should use it
+/// over the session id.
+pub fn build_wake_payload(
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+    forks: &[DueFork],
+) -> String {
     let mut blocks: Vec<String> = Vec::new();
     for fork in forks.iter().filter(|f| f.after.is_empty()) {
-        blocks.push(root_block(fork, session_id, project_root));
+        blocks.push(root_block(fork, session_id, conversation_id, project_root));
     }
     for fork in forks.iter().filter(|f| !f.after.is_empty()) {
-        blocks.push(dependent_block(fork, session_id, project_root));
+        blocks.push(dependent_block(
+            fork,
+            session_id,
+            conversation_id,
+            project_root,
+        ));
     }
 
     let closer = if blocks.len() == 1 {
@@ -156,7 +188,7 @@ mod tests {
 
     #[test]
     fn payload_carries_the_sniffer_marker() {
-        let p = build_wake_payload("s", "/p", &[due("j", &[], false)]);
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], false)]);
         assert!(
             p.contains(WAKE_MARKER),
             "payload must carry the wake marker"
@@ -186,11 +218,13 @@ mod tests {
 
     #[test]
     fn single_root_block() {
-        let p = build_wake_payload("sid-1", "/proj", &[due("journal", &[], false)]);
+        let p = build_wake_payload("sid-1", "conv-1", "/proj", &[due("journal", &[], false)]);
         assert!(p.contains("---\nsource: forksan\ndue: journal (trigger: idle)\n---\n"));
         assert!(p.contains("subagent_type \"fork\""));
         assert!(p.contains("Read the file /x/journal.md"));
         assert!(p.contains("parent session sid-1"));
+        assert!(p.contains("conversation conv-1"));
+        assert!(p.contains("key any per-conversation artifacts on it"));
         assert!(p.contains("project root /proj"));
         assert!(p.contains("Do not read that file yourself"));
         // overlap:false → skip-if-running line present.
@@ -210,13 +244,18 @@ mod tests {
 
     #[test]
     fn overlap_true_omits_skip_line() {
-        let p = build_wake_payload("s", "/p", &[due("j", &[], true)]);
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], true)]);
         assert!(!p.contains("skip spawning it"));
     }
 
     #[test]
     fn multiple_forks_get_plural_closer() {
-        let p = build_wake_payload("s", "/p", &[due("a", &[], false), due("b", &[], false)]);
+        let p = build_wake_payload(
+            "s",
+            "conv-s",
+            "/p",
+            &[due("a", &[], false), due("b", &[], false)],
+        );
         assert!(p.contains("due: a (trigger: idle)"));
         assert!(p.contains("due: b (trigger: idle)"));
         assert!(p.contains("After spawning all forks above"));
@@ -226,6 +265,7 @@ mod tests {
     fn dependents_are_deferred_and_reference_predecessors() {
         let p = build_wake_payload(
             "s",
+            "conv-s",
             "/p",
             &[due("alpha", &[], false), due("beta", &["alpha"], false)],
         );

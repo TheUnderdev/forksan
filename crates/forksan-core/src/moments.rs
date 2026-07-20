@@ -11,6 +11,34 @@ use crate::frontmatter::{ForkDef, ForkRunOn};
 /// fork inherits the session's model, whose window we approximate here.)
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 
+/// The 1M context window Claude Code marks with a `[1m]` suffix on the
+/// session's model id (e.g. `claude-opus-4-8[1m]`).
+pub const CONTEXT_WINDOW_1M: u64 = 1_000_000;
+
+/// The context window for a session, resolved from the model id Claude Code
+/// reports in hook input and the observed gauge. The hook-side model string
+/// keeps the `[1m]` marker (the transcript's `message.model` strips it), so
+/// marked sessions get the 1M window. Fable/Mythos-family models are 1M
+/// unconditionally — their window has no 200k variant, so the bare id is
+/// enough. A gauge that already exceeds the resolved window proves it wrong —
+/// the window bumps to the 1M tier (belt for sessions whose events never
+/// carried a model), and beyond that to the gauge itself so `context_used`
+/// saturates at 100% instead of overshooting.
+pub fn resolve_context_window(model: Option<&str>, prompt_tokens: Option<u64>) -> u64 {
+    let mut window = match model {
+        Some(m) if m.contains("[1m]") || m.contains("fable") || m.contains("mythos") => {
+            CONTEXT_WINDOW_1M
+        }
+        _ => DEFAULT_CONTEXT_WINDOW,
+    };
+    if let Some(pt) = prompt_tokens {
+        if pt > window {
+            window = CONTEXT_WINDOW_1M.max(pt);
+        }
+    }
+    window
+}
+
 /// A fork moment: an event at which rostered forks may fire (matched against
 /// each fork's `run_on` config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +242,66 @@ mod tests {
             Some(ForkRunOn::ContextLeft(50_000))
         );
         assert_eq!(match_moments(&left, &no_max, 240), None);
+    }
+
+    #[test]
+    fn window_resolution() {
+        // No model, small gauge: the default window.
+        assert_eq!(resolve_context_window(None, Some(90_000)), 200_000);
+        assert_eq!(
+            resolve_context_window(Some("claude-opus-4-8"), None),
+            200_000
+        );
+        // The [1m] marker selects the 1M window regardless of gauge.
+        assert_eq!(
+            resolve_context_window(Some("claude-opus-4-8[1m]"), Some(150_000)),
+            1_000_000
+        );
+        // Fable/Mythos models are always 1M — no marker needed.
+        assert_eq!(
+            resolve_context_window(Some("claude-fable-5"), Some(50_000)),
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context_window(Some("claude-mythos-5"), None),
+            1_000_000
+        );
+        // A gauge over the assumed window bumps to the 1M tier (model unknown
+        // or unmarked), and past 1M the gauge itself becomes the window.
+        assert_eq!(resolve_context_window(None, Some(397_929)), 1_000_000);
+        assert_eq!(
+            resolve_context_window(Some("claude-opus-4-8"), Some(250_000)),
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context_window(Some("m[1m]"), Some(1_200_000)),
+            1_200_000
+        );
+    }
+
+    #[test]
+    fn used_pct_respects_1m_window() {
+        // The exact regression: 75% of a 1M session must not fire at 150k.
+        let used = fork(vec![ForkRunOn::ContextUsedPct(75)]);
+        let at_150k = [ForkMoment::Context {
+            prompt_tokens: 150_000,
+            max_tokens: Some(resolve_context_window(
+                Some("claude-opus-4-8[1m]"),
+                Some(150_000),
+            )),
+        }];
+        assert_eq!(match_moments(&used, &at_150k, 240), None);
+        let at_800k = [ForkMoment::Context {
+            prompt_tokens: 800_000,
+            max_tokens: Some(resolve_context_window(
+                Some("claude-opus-4-8[1m]"),
+                Some(800_000),
+            )),
+        }];
+        assert_eq!(
+            match_moments(&used, &at_800k, 240),
+            Some(ForkRunOn::ContextUsedPct(75))
+        );
     }
 
     #[test]

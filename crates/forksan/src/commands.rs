@@ -240,7 +240,12 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
             after: Vec::new(),
         })
         .collect();
-    let payload = build_wake_payload("(the current session)", &root.to_string_lossy(), &due);
+    let payload = build_wake_payload(
+        "(the current session)",
+        "(the current conversation)",
+        &root.to_string_lossy(),
+        &due,
+    );
 
     println!(
         "forksan can no longer spawn forks itself — forks run as fork subagents of an\n\

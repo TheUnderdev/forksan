@@ -1,7 +1,7 @@
 {
   "name": "forksan",
   "displayName": "forksan",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Forks for Claude Code: at idle and context-threshold moments an asyncRewake Stop hook has your session spawn background fork subagents that inherit its context and report back.",
   "author": {
     "name": "TheUnderdev",

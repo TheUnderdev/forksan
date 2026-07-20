@@ -8,7 +8,7 @@
 //! SessionEnd cancel any parked stop-wait.
 
 use forksan_core::config::{load_config_at, Config, Paths};
-use forksan_core::moments::{idle_deadlines, ForkMoment, DEFAULT_CONTEXT_WINDOW};
+use forksan_core::moments::{idle_deadlines, resolve_context_window, ForkMoment};
 use forksan_core::protocol::{Event, EventKind, ResponseBody};
 use forksan_core::store::{SessionStatus, Store};
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ pub fn now() -> i64 {
 /// idle deadline whose fire time (`base + d`) has passed.
 fn elapsed_moments(
     prompt_tokens: Option<u64>,
+    max_tokens: u64,
     base: i64,
     deadlines: &[u64],
     up_to: i64,
@@ -38,7 +39,7 @@ fn elapsed_moments(
     if let Some(pt) = prompt_tokens {
         moments.push(ForkMoment::Context {
             prompt_tokens: pt,
-            max_tokens: Some(DEFAULT_CONTEXT_WINDOW),
+            max_tokens: Some(max_tokens),
         });
     }
     for &d in deadlines {
@@ -347,6 +348,11 @@ impl Daemon {
         // Idle timing is measured from the pause baseline (the first Stop of
         // this pause), so a wake-turn's own Stop doesn't restart the clock.
         let baseline = session.pause_started_at.unwrap_or(t);
+        // Context thresholds are judged against the session's real window: the
+        // hook-reported model id keeps Claude Code's `[1m]` marker (the session
+        // row holds the latest non-null value), and an oversized gauge bumps
+        // an under-assumed window.
+        let max_tokens = resolve_context_window(session.model.as_deref(), prompt_tokens);
 
         // Idle deadlines (seconds from the baseline) this session's forks need.
         let deadlines = {
@@ -364,7 +370,7 @@ impl Daemon {
         // Context thresholds are known immediately (the turn just ended);
         // idle forks come due as their deadlines elapse.
         let due_now = |slf: &Arc<Self>| -> bool {
-            let moments = elapsed_moments(prompt_tokens, baseline, &deadlines, now());
+            let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
             !moments.is_empty()
                 && !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
         };
@@ -405,7 +411,7 @@ impl Daemon {
         // Phase C: re-evaluate over every moment elapsed by now (deadlines that
         // landed during the debounce join the batch), then issue one wake —
         // stamping throttles and latches at this point.
-        let moments = elapsed_moments(prompt_tokens, baseline, &deadlines, now());
+        let moments = elapsed_moments(prompt_tokens, max_tokens, baseline, &deadlines, now());
         let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
         if let Some(payload) = crate::planner::build_wake(self, &session, selected) {
             return ResponseBody::Wake { payload };

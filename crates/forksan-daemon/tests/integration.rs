@@ -72,6 +72,21 @@ impl Harness {
         path
     }
 
+    /// Append a further assistant turn to the transcript (the gauge is
+    /// byte-offset tracked, so growth must be real appended lines).
+    fn append_transcript(&self, tokens: u64) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.project.join("transcript.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"m\",\"usage\":{{\"input_tokens\":{tokens},\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}"
+        )
+        .unwrap();
+    }
+
     fn start_daemon(&mut self) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_forksan-daemon"));
         cmd.env("FORKSAN_HOME", &self.home)
@@ -496,6 +511,74 @@ fn context_threshold_wakes_and_latches_once() {
     assert!(
         matches!(body, ResponseBody::Waited),
         "context re-fired: {body:?}"
+    );
+}
+
+#[test]
+fn context_used_respects_1m_model_window() {
+    let mut h = Harness::new("1h", "0"); // long idle: only context can fire
+    h.write_fork(
+        "ctx75.md",
+        "---\nfork: true\nrun_on:\n  - context_used: 75%\n---\nnearly full",
+    );
+    h.start_daemon();
+    // 300k tokens: over 75% of the default 200k window, well under 75% of 1M.
+    let transcript = h.write_transcript(300_000);
+
+    let mut start = h.event(EventKind::SessionStart, "s1");
+    start.transcript_path = Some(transcript.clone());
+    start.model = Some("claude-opus-4-8[1m]".to_string());
+    assert_ack(h.send_event(start));
+
+    // Must NOT wake on a 1M session at 30% usage → parks until cancelled.
+    let mut stop = h.event(EventKind::Stop, "s1");
+    stop.transcript_path = Some(transcript.clone());
+    let rx = h.park_stop_wait(stop);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let body = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(body, ResponseBody::Waited),
+        "context fired at 30% of a 1M window: {body:?}"
+    );
+
+    // Past 75% of 1M the trigger fires.
+    h.append_transcript(800_000);
+    let mut stop2 = h.event(EventKind::Stop, "s1");
+    stop2.transcript_path = Some(transcript);
+    let rx2 = h.park_stop_wait(stop2);
+    let payload = wake_payload(rx2.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(
+        payload.contains("due: ctx75 (trigger: context_used:75%)"),
+        "{payload}"
+    );
+}
+
+#[test]
+fn oversized_gauge_bumps_unmarked_window() {
+    let mut h = Harness::new("1h", "0");
+    h.write_fork(
+        "ctx75.md",
+        "---\nfork: true\nrun_on:\n  - context_used: 75%\n---\nnearly full",
+    );
+    h.start_daemon();
+    // No model marker anywhere, but the gauge already exceeds 200k: the
+    // window must bump to the 1M tier instead of firing at "150%".
+    let transcript = h.write_transcript(300_000);
+
+    let mut start = h.event(EventKind::SessionStart, "s1");
+    start.transcript_path = Some(transcript.clone());
+    assert_ack(h.send_event(start));
+
+    let mut stop = h.event(EventKind::Stop, "s1");
+    stop.transcript_path = Some(transcript);
+    let rx = h.park_stop_wait(stop);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_ack(h.send_event(h.prompt_submit("s1", true)));
+    let body = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(body, ResponseBody::Waited),
+        "context fired despite oversized-gauge bump: {body:?}"
     );
 }
 

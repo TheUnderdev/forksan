@@ -230,9 +230,10 @@ stamped at **wake-issuance** (when the daemon answers the poll), not at fork com
 - "Once per session" latches (context thresholds) reset when a session is resumed — Claude Code
   assigns resumed sessions a new id, so each resume leg counts fresh.
 - The transcript-based context gauge parses an internal Claude Code format; if it changes, the
-  `context_*` triggers degrade to inactive rather than erroring. In v0.5 the context window used for
-  `context_used` / `context_left` is a fixed 200k approximation (the per-model window config was
-  dropped).
+  `context_*` triggers degrade to inactive rather than erroring. The window used for
+  `context_used` / `context_left` is 200k by default and 1M when the session's model carries Claude
+  Code's `[1m]` marker (e.g. `claude-opus-4-8[1m]`); a gauge that exceeds the assumed window bumps
+  it to the 1M tier as a fallback. The per-model window config was dropped in v0.5.
 - A wake requires a live parked `Stop` hook. If the daemon dies while a session is idle, that idle
   opportunity is simply missed — the next turn re-arms it. A hook never wedges or errors a session.
 - A session whose Claude process dies (killed terminal, restart) is closed automatically: its parked

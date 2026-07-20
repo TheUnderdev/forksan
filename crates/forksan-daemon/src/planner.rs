@@ -235,8 +235,19 @@ pub fn build_wake(
         })
         .collect();
 
+    // The conversation id survives resume: a resumed leg gets a fresh session
+    // id but appends to the original leg's transcript, so the transcript stem
+    // is the stable identity. No transcript known → the session id.
+    let conversation = session
+        .transcript_path
+        .as_deref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| session.session_id.clone());
+
     Some(build_wake_payload(
         &session.session_id,
+        &conversation,
         &session.project_root.to_string_lossy(),
         &due,
     ))
