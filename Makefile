@@ -1,0 +1,69 @@
+VERSION      := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+MAC_TARGETS   := aarch64-apple-darwin x86_64-apple-darwin
+LINUX_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+DIST          := dist
+
+.PHONY: check fmt clippy test shellcheck version-check build dist release clean
+
+check: fmt clippy test shellcheck version-check
+
+fmt:
+	cargo fmt --check
+
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+	cargo test --workspace
+
+shellcheck:
+	shellcheck plugin/scripts/*.sh
+
+version-check:
+	@PLUGIN=$$(python3 -c "import json;print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])"); \
+	echo "workspace=$(VERSION) plugin=$$PLUGIN"; \
+	test "$(VERSION)" = "$$PLUGIN" || { echo "version mismatch"; exit 1; }
+
+build:
+	cargo build --workspace
+
+# Cross-compiled release tarballs for all four targets into dist/.
+# macOS targets build natively (rustup target add as needed); Linux musl
+# targets need `cross` (cargo install cross) and a running Docker daemon.
+dist: $(addprefix dist-,$(MAC_TARGETS) $(LINUX_TARGETS))
+
+dist-aarch64-apple-darwin dist-x86_64-apple-darwin: dist-%:
+	rustup target add $*
+	cargo build --release --target $* -p forksan -p forksan-daemon
+	$(MAKE) package TARGET=$*
+
+dist-x86_64-unknown-linux-musl dist-aarch64-unknown-linux-musl: dist-%:
+	@command -v cross >/dev/null || { echo "cross not found: cargo install cross (needs Docker running)"; exit 1; }
+	cross build --release --target $* -p forksan -p forksan-daemon
+	$(MAKE) package TARGET=$*
+
+package:
+	@test -n "$(TARGET)" || { echo "package: TARGET not set"; exit 1; }
+	$(eval ASSET := forksan-v$(VERSION)-$(TARGET))
+	rm -rf $(DIST)/$(TARGET)
+	mkdir -p $(DIST)/$(TARGET)/bin
+	cp target/$(TARGET)/release/forksan target/$(TARGET)/release/forksan-daemon $(DIST)/$(TARGET)/bin/
+	-strip $(DIST)/$(TARGET)/bin/forksan $(DIST)/$(TARGET)/bin/forksan-daemon 2>/dev/null
+	tar -czf $(DIST)/$(ASSET).tar.gz -C $(DIST)/$(TARGET) bin
+	shasum -a 256 $(DIST)/$(ASSET).tar.gz | sed 's|$(DIST)/||' > $(DIST)/$(ASSET).tar.gz.sha256
+
+# Full manual release: checks, builds all targets, tags v<version>,
+# publishes a GitHub release with the eight assets.
+release: check dist
+	@test -z "$$(git status --porcelain)" || { echo "working tree not clean"; exit 1; }
+	@COUNT=$$(ls $(DIST)/*.tar.gz $(DIST)/*.sha256 | wc -l); \
+	test "$$COUNT" -eq 8 || { echo "expected 8 assets, got $$COUNT"; exit 1; }
+	git tag "v$(VERSION)"
+	git push origin main "v$(VERSION)"
+	gh release create "v$(VERSION)" $(DIST)/*.tar.gz $(DIST)/*.sha256 \
+		--title "forksan v$(VERSION)" \
+		--generate-notes
+
+clean:
+	rm -rf $(DIST)
+	cargo clean
