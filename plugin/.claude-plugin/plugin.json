@@ -1,7 +1,7 @@
 {
   "name": "forksan",
   "displayName": "forksan",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Forks for Claude Code: run throwaway forked-context prompts at lifecycle moments (idle, compact, session start/end, context thresholds) and inject their reports back into your session.",
   "author": {
     "name": "TheUnderdev",
