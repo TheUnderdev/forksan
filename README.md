@@ -112,9 +112,9 @@ reading the override always applies.
 
 ### Fork permissions
 
-A fork runs headless (`claude -p`) with isolated settings, so it **cannot answer permission
-prompts** — by default it can only use read-only tools, and anything needing Write, Edit, or
-Bash is denied. Grant what a fork needs up front:
+A fork runs headless (`claude -p`), so it **cannot answer permission prompts** — beyond
+whatever your settings already allow, anything needing Write, Edit, or Bash is denied. Grant
+what a fork needs up front:
 
 - `allowed_tools` lists [Claude Code permission rules](https://docs.claude.com/en/docs/claude-code/iam#permission-rules),
   each passed verbatim to `--allowedTools`. Scope them tightly — prefer `Bash(git add:*)`,
@@ -161,8 +161,12 @@ Claude Code ──hooks──▶ forksan (CLI) ──unix socket──▶ forksa
   parent as closely as `claude` allows and reuses the **prompt cache** wherever possible.
   Measured cache behavior (byte-level request diffing): a fork of a **headless/print-mode**
   parent reuses ~100% of the parent's cached prefix; a fork of an **interactive** parent cannot
-  reuse the parent's cache at all — interactive sessions load a larger tool set than `-p` mode
-  (interactive-only tools lead the prefix), which is not controllable from the CLI. Consecutive
+  reuse the parent's cache at all. This is unfixable from either side of the CLI: beyond the
+  larger interactive tool set (which `--disallowedTools` *can* equalize), the request's first
+  system blocks are stamped by launch mode itself — `cc_entrypoint=cli` + "You are Claude
+  Code…" interactively vs `cc_entrypoint=sdk-cli` + a Claude-agent identity under `-p` — and
+  the cache breakpoints sit after those blocks, so the prefixes can never match. Don't bother
+  launching "stripped" interactive sessions hoping forks get cheaper; they don't. Consecutive
   forks of the *same* session always share their own full-config prefix (1-hour cache TTL), so
   repeated fork moments stay cheap either way. For big sessions triggering expensive-model
   forks, a `model:` override on the fork is often the bigger cost lever.
