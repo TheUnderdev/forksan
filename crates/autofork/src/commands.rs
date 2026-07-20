@@ -1,10 +1,10 @@
 //! User-facing commands: status, forks, run, logs, doctor.
 
 use crate::client::Client;
-use forksan_core::config::Paths;
-use forksan_core::project::project_root;
-use forksan_core::protocol::{RequestBody, ResponseBody};
-use forksan_core::wake::{build_wake_payload, DueFork};
+use autofork_core::config::Paths;
+use autofork_core::project::project_root;
+use autofork_core::protocol::{RequestBody, ResponseBody};
+use autofork_core::wake::{build_wake_payload, DueFork};
 use std::time::Duration;
 
 fn connect(paths: &Paths) -> Result<Client, String> {
@@ -113,7 +113,7 @@ pub fn status(paths: &Paths) -> Result<(), String> {
         return Err("unexpected response".into());
     };
     let t = now();
-    println!("forksan daemon v{} (pid {})", info.version, info.pid);
+    println!("autofork daemon v{} (pid {})", info.version, info.pid);
     println!("sessions: {}", info.sessions.len());
     for s in &info.sessions {
         let tokens = s
@@ -160,7 +160,7 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         return Err("unexpected response".into());
     };
     if items.is_empty() {
-        println!("no forks discovered (looked for .forksan/forks/ up from here and user-level)");
+        println!("no forks discovered (looked for .autofork/forks/ up from here and user-level)");
         return Ok(());
     }
     println!("forks visible from {} :", root.display());
@@ -202,7 +202,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = project_root(&cwd);
     let user_forks = paths.base.join("forks");
-    let (entries, _) = forksan_core::discovery::discover_forks(&cwd, Some(&user_forks));
+    let (entries, _) = autofork_core::discovery::discover_forks(&cwd, Some(&user_forks));
 
     let picked: Vec<_> = match (&name, &tag) {
         (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
@@ -248,7 +248,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
     );
 
     println!(
-        "forksan can no longer spawn forks itself — forks run as fork subagents of an\n\
+        "autofork can no longer spawn forks itself — forks run as fork subagents of an\n\
          interactive session. Paste the following into an interactive Claude Code session\n\
          to run the selected fork(s) now:\n"
     );
@@ -288,7 +288,7 @@ pub fn logs(paths: &Paths, follow: bool) -> Result<(), String> {
 pub fn doctor(paths: &Paths) -> Result<(), String> {
     let mut problems = 0;
     let ok = |msg: &str| println!("  ok: {msg}");
-    println!("forksan doctor");
+    println!("autofork doctor");
 
     // Binaries.
     match std::env::current_exe() {
@@ -298,12 +298,12 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
                 exe.display(),
                 env!("CARGO_PKG_VERSION")
             ));
-            let daemon_bin = exe.parent().map(|p| p.join("forksan-daemon"));
+            let daemon_bin = exe.parent().map(|p| p.join("autofork-daemon"));
             match daemon_bin {
                 Some(p) if p.is_file() => ok(&format!("daemon binary: {}", p.display())),
                 _ => {
                     problems += 1;
-                    println!("  PROBLEM: forksan-daemon not found next to the CLI");
+                    println!("  PROBLEM: autofork-daemon not found next to the CLI");
                 }
             }
         }
@@ -344,7 +344,7 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
     // Claude Code version gating for the `fork` subagent type:
     //   >= 2.1.161            enabled by default in interactive sessions
     //   2.1.117 ..= 2.1.160   exists but gated behind CLAUDE_CODE_FORK_SUBAGENT=1
-    //   < 2.1.117             no fork subagent — too old for forksan v0.5
+    //   < 2.1.117             no fork subagent — too old for autofork v0.5
     match std::process::Command::new("claude")
         .arg("--version")
         .output()
@@ -366,7 +366,7 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
                 Some(_) => {
                     problems += 1;
                     println!(
-                        "  PROBLEM: claude {raw} is too old for forksan v0.5 (needs the fork \
+                        "  PROBLEM: claude {raw} is too old for autofork v0.5 (needs the fork \
                          subagent, >= 2.1.117)"
                     );
                 }
@@ -389,7 +389,7 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
             "  PROBLEM: custom agent 'fork' at {} shadows/impersonates the",
             f.display()
         );
-        println!("           built-in fork subagent type — forksan forks would silently lose");
+        println!("           built-in fork subagent type — autofork forks would silently lose");
         println!("           conversation context; delete it.");
     }
 
@@ -445,7 +445,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let project = tmp.path().join("proj");
-        std::fs::create_dir_all(project.join(".forksan")).unwrap();
+        std::fs::create_dir_all(project.join(".autofork")).unwrap();
 
         // Nothing yet.
         assert!(impostor_agent_files(Some(&home), &project).is_empty());

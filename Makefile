@@ -35,22 +35,22 @@ dist: $(addprefix dist-,$(MAC_TARGETS) $(LINUX_TARGETS))
 
 dist-aarch64-apple-darwin dist-x86_64-apple-darwin: dist-%:
 	rustup target add $*
-	cargo build --release --target $* -p forksan -p forksan-daemon
+	cargo build --release --target $* -p autofork -p autofork-daemon
 	$(MAKE) package TARGET=$*
 
 dist-x86_64-unknown-linux-musl dist-aarch64-unknown-linux-musl: dist-%:
 	@command -v cargo-zigbuild >/dev/null || { echo "cargo-zigbuild not found: brew install zig cargo-zigbuild"; exit 1; }
 	rustup target add $*
-	cargo zigbuild --release --target $* -p forksan -p forksan-daemon
+	cargo zigbuild --release --target $* -p autofork -p autofork-daemon
 	$(MAKE) package TARGET=$*
 
 package:
 	@test -n "$(TARGET)" || { echo "package: TARGET not set"; exit 1; }
-	$(eval ASSET := forksan-v$(VERSION)-$(TARGET))
+	$(eval ASSET := autofork-v$(VERSION)-$(TARGET))
 	rm -rf $(DIST)/$(TARGET)
 	mkdir -p $(DIST)/$(TARGET)/bin
-	cp target/$(TARGET)/release/forksan target/$(TARGET)/release/forksan-daemon $(DIST)/$(TARGET)/bin/
-	-strip $(DIST)/$(TARGET)/bin/forksan $(DIST)/$(TARGET)/bin/forksan-daemon 2>/dev/null
+	cp target/$(TARGET)/release/autofork target/$(TARGET)/release/autofork-daemon $(DIST)/$(TARGET)/bin/
+	-strip $(DIST)/$(TARGET)/bin/autofork $(DIST)/$(TARGET)/bin/autofork-daemon 2>/dev/null
 	tar -czf $(DIST)/$(ASSET).tar.gz -C $(DIST)/$(TARGET) bin
 	shasum -a 256 $(DIST)/$(ASSET).tar.gz | sed 's|$(DIST)/||' > $(DIST)/$(ASSET).tar.gz.sha256
 
@@ -63,7 +63,7 @@ release: check dist
 	git tag "v$(VERSION)"
 	git push origin main "v$(VERSION)"
 	gh release create "v$(VERSION)" $(DIST)/*.tar.gz $(DIST)/*.sha256 \
-		--title "forksan v$(VERSION)" \
+		--title "autofork v$(VERSION)" \
 		--generate-notes
 
 clean:

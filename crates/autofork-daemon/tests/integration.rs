@@ -10,10 +10,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use forksan_core::protocol::{
+use autofork_core::protocol::{
     encode, Event, EventKind, Request, RequestBody, Response, ResponseBody,
 };
-use forksan_core::PROTO_VERSION;
+use autofork_core::PROTO_VERSION;
 
 struct Harness {
     _tmp: tempfile::TempDir,
@@ -31,7 +31,7 @@ impl Harness {
         let home = base.join("fsan");
         let project = base.join("proj");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(project.join(".forksan/forks")).unwrap();
+        std::fs::create_dir_all(project.join(".autofork/forks")).unwrap();
         std::fs::write(
             home.join("config.toml"),
             format!(
@@ -55,7 +55,7 @@ impl Harness {
     }
 
     fn write_fork(&self, rel: &str, content: &str) {
-        let path = self.project.join(".forksan/forks").join(rel);
+        let path = self.project.join(".autofork/forks").join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
@@ -88,14 +88,14 @@ impl Harness {
     }
 
     fn start_daemon(&mut self) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_forksan-daemon"));
-        cmd.env("FORKSAN_HOME", &self.home)
-            .env("FORKSAN_SOCKET", &self.socket)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_autofork-daemon"));
+        cmd.env("AUTOFORK_HOME", &self.home)
+            .env("AUTOFORK_SOCKET", &self.socket)
             .env("RUST_LOG", "debug")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(ms) = self.poll_grace_ms {
-            cmd.env("FORKSAN_POLL_LOSS_GRACE_MS", ms.to_string());
+            cmd.env("AUTOFORK_POLL_LOSS_GRACE_MS", ms.to_string());
         }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
@@ -198,7 +198,7 @@ impl Harness {
         }
     }
 
-    fn open_sessions(&self) -> Vec<forksan_core::protocol::SessionInfo> {
+    fn open_sessions(&self) -> Vec<autofork_core::protocol::SessionInfo> {
         match self.request(RequestBody::Status) {
             ResponseBody::StatusInfo(info) => info.sessions,
             other => panic!("unexpected: {other:?}"),
@@ -260,7 +260,7 @@ fn idle_wake_names_the_fork() {
     let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
 
     let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
-    assert!(payload.contains("source: forksan"));
+    assert!(payload.contains("source: autofork"));
     assert!(payload.contains("due: journal (trigger: idle)"));
     assert!(payload.contains("subagent_type \"fork\""));
     assert!(payload.contains("journal.md"));

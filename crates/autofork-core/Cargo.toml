@@ -1,24 +1,19 @@
 [package]
-name = "forksan-daemon"
-description = "The forksan daemon: session tracking, fork moments, fork execution"
+name = "autofork-core"
+description = "Core semantics for autofork: fork discovery, frontmatter, scheduling, store, protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "forksan-daemon"
-path = "src/main.rs"
-
 [dependencies]
-forksan-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+serde_yaml.workspace = true
+rusqlite.workspace = true
+toml.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

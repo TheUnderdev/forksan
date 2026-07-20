@@ -1,4 +1,4 @@
-//! CLI hook-path tests for `forksan hook <event>`.
+//! CLI hook-path tests for `autofork hook <event>`.
 //!
 //! The stop-wait long poll is exercised against a *mock* daemon socket (so we
 //! can assert exit codes and stderr precisely) plus one real-daemon end-to-end
@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use forksan_core::protocol::{encode, Request, RequestBody, Response, ResponseBody};
-use forksan_core::PROTO_VERSION;
+use autofork_core::protocol::{encode, Request, RequestBody, Response, ResponseBody};
+use autofork_core::PROTO_VERSION;
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -28,7 +28,7 @@ impl Env {
         let home = base.join("fsan");
         let project = base.join("proj");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(project.join(".forksan/forks")).unwrap();
+        std::fs::create_dir_all(project.join(".autofork/forks")).unwrap();
         std::fs::write(
             home.join("config.toml"),
             format!("default_idle_deadline = \"{idle}\"\nquiet_period = \"1h\"\nwake_debounce = \"0\"\n"),
@@ -51,12 +51,12 @@ impl Env {
         })
     }
 
-    /// Run `forksan hook <event>` to completion; returns (exit_code, stdout, stderr).
+    /// Run `autofork hook <event>` to completion; returns (exit_code, stdout, stderr).
     fn hook(&self, event: &str, stdin_json: &serde_json::Value) -> (Option<i32>, String, String) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
             .args(["hook", event])
-            .env("FORKSAN_HOME", &self.home)
-            .env("FORKSAN_SOCKET", &self.socket)
+            .env("AUTOFORK_HOME", &self.home)
+            .env("AUTOFORK_SOCKET", &self.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -216,7 +216,7 @@ fn stop_wait_closed_socket_exits_0() {
 fn real_daemon_stop_wait_wakes_on_idle() {
     let env = Env::new("1s");
     std::fs::write(
-        env.project.join(".forksan/forks/journal.md"),
+        env.project.join(".autofork/forks/journal.md"),
         "---\nfork: true\nrun_on: [idle]\n---\nJOURNAL BODY",
     )
     .unwrap();
@@ -228,7 +228,7 @@ fn real_daemon_stop_wait_wakes_on_idle() {
     // stop-wait blocks until the 1s idle deadline, then wakes (exit 2).
     let (code, _stdout, stderr) = env.hook("stop-wait", &env.hook_input("s1"));
     assert_eq!(code, Some(2), "real daemon should wake at idle");
-    assert!(stderr.contains("source: forksan"));
+    assert!(stderr.contains("source: autofork"));
     assert!(stderr.contains("due: journal"));
     assert!(stderr.contains("subagent_type \"fork\""));
 }
@@ -237,17 +237,17 @@ fn real_daemon_stop_wait_wakes_on_idle() {
 fn disable_tags_env_filters_fork() {
     let env = Env::new("1s");
     std::fs::write(
-        env.project.join(".forksan/forks/tagged.md"),
+        env.project.join(".autofork/forks/tagged.md"),
         "---\nfork: true\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED BODY",
     )
     .unwrap();
 
     let run = |event: &str| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
             .args(["hook", event])
-            .env("FORKSAN_HOME", &env.home)
-            .env("FORKSAN_SOCKET", &env.socket)
-            .env("FORKSAN_DISABLE_TAGS", "ci")
+            .env("AUTOFORK_HOME", &env.home)
+            .env("AUTOFORK_SOCKET", &env.socket)
+            .env("AUTOFORK_DISABLE_TAGS", "ci")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -270,10 +270,10 @@ fn disable_tags_env_filters_fork() {
     let stdin = env.hook_input("s1").to_string();
     let handle = thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1800));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
             .args(["hook", "user-prompt-submit"])
-            .env("FORKSAN_HOME", &home)
-            .env("FORKSAN_SOCKET", &socket)
+            .env("AUTOFORK_HOME", &home)
+            .env("AUTOFORK_SOCKET", &socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -296,16 +296,16 @@ fn disable_tags_env_filters_fork() {
 fn fork_env_guard_short_circuits_hook() {
     let env = Env::new("1h");
     std::fs::write(
-        env.project.join(".forksan/forks/journal.md"),
+        env.project.join(".autofork/forks/journal.md"),
         "---\nfork: true\nrun_on: [idle]\n---\nBODY",
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
         .args(["hook", "stop-wait"])
-        .env("FORKSAN_HOME", &env.home)
-        .env("FORKSAN_SOCKET", &env.socket)
-        .env("FORKSAN_FORK", "1")
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
+        .env("AUTOFORK_FORK", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -333,10 +333,10 @@ fn concurrent_session_starts_race_to_one_daemon() {
     let env = Env::new("1h");
     let mut children = Vec::new();
     for i in 0..5 {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
             .args(["hook", "session-start"])
-            .env("FORKSAN_HOME", &env.home)
-            .env("FORKSAN_SOCKET", &env.socket)
+            .env("AUTOFORK_HOME", &env.home)
+            .env("AUTOFORK_SOCKET", &env.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -353,10 +353,10 @@ fn concurrent_session_starts_race_to_one_daemon() {
     for mut c in children {
         assert!(c.wait().unwrap().success());
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_forksan"))
+    let out = Command::new(env!("CARGO_BIN_EXE_autofork"))
         .arg("status")
-        .env("FORKSAN_HOME", &env.home)
-        .env("FORKSAN_SOCKET", &env.socket)
+        .env("AUTOFORK_HOME", &env.home)
+        .env("AUTOFORK_SOCKET", &env.socket)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -372,10 +372,10 @@ fn hook_never_fails_on_garbage_stdin() {
         "stop-wait",
         "session-end",
     ] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_autofork"))
             .args(["hook", event])
-            .env("FORKSAN_HOME", &env.home)
-            .env("FORKSAN_SOCKET", &env.socket)
+            .env("AUTOFORK_HOME", &env.home)
+            .env("AUTOFORK_SOCKET", &env.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -4,9 +4,9 @@ mod server;
 mod sweep;
 mod transcript;
 
+use autofork_core::config::Paths;
+use autofork_core::store::Store;
 use daemon::Daemon;
-use forksan_core::config::Paths;
-use forksan_core::store::Store;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 
@@ -37,7 +37,7 @@ fn main() {
         .init();
 
     let Some(paths) = Paths::from_env() else {
-        eprintln!("forksan-daemon: cannot determine home directory");
+        eprintln!("autofork-daemon: cannot determine home directory");
         std::process::exit(1);
     };
 
@@ -85,7 +85,7 @@ async fn async_main(paths: Paths, store: Store) {
     tracing::info!(
         version = Daemon::version(),
         socket = %socket.display(),
-        "forksan daemon up"
+        "autofork daemon up"
     );
 
     let daemon = Daemon::new(paths, store);
@@ -107,5 +107,5 @@ async fn async_main(paths: Paths, store: Store) {
     }
 
     let _ = std::fs::remove_file(&socket);
-    tracing::info!("forksan daemon down");
+    tracing::info!("autofork daemon down");
 }

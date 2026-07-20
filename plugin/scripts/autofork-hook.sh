@@ -1,5 +1,5 @@
 #!/bin/sh
-# forksan hook shim: exec the persistent-data binary (it survives plugin
+# autofork hook shim: exec the persistent-data binary (it survives plugin
 # updates), or kick off a background bootstrap when it's missing. `exec`
 # propagates the binary's exit code — the Stop hook (`stop-wait`) exits 2 to
 # wake the session; a missing-binary bootstrap path exits 0 (swallows it).
@@ -8,11 +8,11 @@
 # SubagentStop (not Stop) so they never reach the trigger path; but if these
 # vars were ever present we bail before any binary exec. The Rust entrypoint
 # enforces the same guard as the real defense.
-if [ -n "${FORKSAN_FORK}" ] || [ -n "${FORKSAN_SESSION_ID}" ]; then
+if [ -n "${AUTOFORK_FORK}" ] || [ -n "${AUTOFORK_SESSION_ID}" ]; then
     exit 0
 fi
 
-BIN="${CLAUDE_PLUGIN_DATA}/bin/forksan"
+BIN="${CLAUDE_PLUGIN_DATA}/bin/autofork"
 if [ -x "$BIN" ]; then
     exec "$BIN" hook "$1"
 fi

@@ -7,10 +7,10 @@
 //! PromptSubmit, SessionEnd) just keep session bookkeeping — and PromptSubmit /
 //! SessionEnd cancel any parked stop-wait.
 
-use forksan_core::config::{load_config_at, Config, Paths};
-use forksan_core::moments::{idle_deadlines, resolve_context_window, ForkMoment};
-use forksan_core::protocol::{Event, EventKind, ResponseBody};
-use forksan_core::store::{SessionStatus, Store};
+use autofork_core::config::{load_config_at, Config, Paths};
+use autofork_core::moments::{idle_deadlines, resolve_context_window, ForkMoment};
+use autofork_core::protocol::{Event, EventKind, ResponseBody};
+use autofork_core::store::{SessionStatus, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -80,9 +80,9 @@ const WAKE_GRACE_SECS: i64 = 20;
 
 /// After a parked poll drops unanswered, wait this long for a fresh event
 /// before closing the session (the Claude process is presumed dead). Overridable
-/// via `FORKSAN_POLL_LOSS_GRACE_MS` (tests shorten it).
+/// via `AUTOFORK_POLL_LOSS_GRACE_MS` (tests shorten it).
 fn poll_loss_grace() -> Duration {
-    std::env::var("FORKSAN_POLL_LOSS_GRACE_MS")
+    std::env::var("AUTOFORK_POLL_LOSS_GRACE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
@@ -356,7 +356,7 @@ impl Daemon {
 
         // Idle deadlines (seconds from the baseline) this session's forks need.
         let deadlines = {
-            let (entries, _) = forksan_core::discovery::discover_forks(
+            let (entries, _) = autofork_core::discovery::discover_forks(
                 &session.cwd,
                 Some(&self.user_forks_root()),
             );

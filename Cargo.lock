@@ -74,6 +74,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "autofork"
+version = "0.6.0"
+dependencies = [
+ "autofork-core",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "autofork-core"
+version = "0.6.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "autofork-daemon"
+version = "0.6.0"
+dependencies = [
+ "autofork-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -186,46 +226,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "forksan"
-version = "0.5.5"
-dependencies = [
- "clap",
- "forksan-core",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "forksan-core"
-version = "0.5.5"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "forksan-daemon"
-version = "0.5.5"
-dependencies = [
- "forksan-core",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "getrandom"

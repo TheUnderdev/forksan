@@ -1,4 +1,4 @@
-//! Fork discovery: scan `.forksan/forks/` trees for fork definitions.
+//! Fork discovery: scan `.autofork/forks/` trees for fork definitions.
 //!
 //! Two layouts are supported inside a forks root, in any mix:
 //! - a bare `<name>.md` file with YAML frontmatter
@@ -21,20 +21,20 @@ pub struct ForkEntry {
     pub name: String,
     /// Absolute path of the definition file (`…/<name>.md` or `…/FORK.md`).
     pub path: PathBuf,
-    /// The forks root this entry came from (`…/.forksan/forks`).
+    /// The forks root this entry came from (`…/.autofork/forks`).
     pub root: PathBuf,
     pub parsed: ParsedFork,
 }
 
-/// The `.forksan/forks` roots relevant to `dir`: each ancestor's (including
+/// The `.autofork/forks` roots relevant to `dir`: each ancestor's (including
 /// `dir` itself), nearest first, then `user_forks_root` (the user-level
-/// forks directory, e.g. `~/.forksan/forks`) if not already among them.
+/// forks directory, e.g. `~/.autofork/forks`) if not already among them.
 pub fn fork_roots(dir: &Path, user_forks_root: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let start = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let mut cur = Some(start.as_path());
     while let Some(d) = cur {
-        let candidate = d.join(".forksan").join("forks");
+        let candidate = d.join(".autofork").join("forks");
         if candidate.is_dir() {
             roots.push(candidate);
         }
@@ -170,21 +170,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("proj");
         write(
-            &root.join(".forksan/forks/journal.md"),
+            &root.join(".autofork/forks/journal.md"),
             "---\nfork: true\ndescription: j\n---\nbody",
         );
         write(
-            &root.join(".forksan/forks/cleanup/FORK.md"),
+            &root.join(".autofork/forks/cleanup/FORK.md"),
             "---\nfork: true\nrun_on: [idle]\n---\nbody",
         );
         // A companion note (no marker, no fork-like keys) is silently ignored.
         write(
-            &root.join(".forksan/forks/maint/deep/notes.md"),
+            &root.join(".autofork/forks/maint/deep/notes.md"),
             "no frontmatter reference material",
         );
         // Ignored: dotfiles, non-md files, dirs without FORK.md are recursed only.
-        write(&root.join(".forksan/forks/.hidden.md"), "x");
-        write(&root.join(".forksan/forks/readme.txt"), "x");
+        write(&root.join(".autofork/forks/.hidden.md"), "x");
+        write(&root.join(".autofork/forks/readme.txt"), "x");
 
         let (entries, warnings) = discover_forks(&root, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -195,7 +195,7 @@ mod tests {
         // Roots are canonicalized (macOS /var vs /private/var).
         assert_eq!(
             journal.root,
-            root.canonicalize().unwrap().join(".forksan/forks")
+            root.canonicalize().unwrap().join(".autofork/forks")
         );
     }
 
@@ -205,20 +205,20 @@ mod tests {
         let root = tmp.path().join("p");
         // A real fork.
         write(
-            &root.join(".forksan/forks/real.md"),
+            &root.join(".autofork/forks/real.md"),
             "---\nfork: true\nrun_on: [idle]\n---\nbody",
         );
         // A migration mistake: fork keys but no marker → warned, not a fork.
         write(
-            &root.join(".forksan/forks/oops.md"),
+            &root.join(".autofork/forks/oops.md"),
             "---\nrun_on: [idle]\nthrottle: 1h\n---\nbody",
         );
         // Explicit opt-out and a plain note → silent.
         write(
-            &root.join(".forksan/forks/note.md"),
+            &root.join(".autofork/forks/note.md"),
             "---\nfork: false\nrun_on: [idle]\n---\nb",
         );
-        write(&root.join(".forksan/forks/plain.md"), "just notes");
+        write(&root.join(".autofork/forks/plain.md"), "just notes");
 
         let (entries, warnings) = discover_forks(&root, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -234,28 +234,28 @@ mod tests {
         let inner = outer.join("inner");
         let home = tmp.path().join("home");
         write(
-            &outer.join(".forksan/forks/shared.md"),
+            &outer.join(".autofork/forks/shared.md"),
             "---\nfork: true\n---\nouter body",
         );
         write(
-            &inner.join(".forksan/forks/shared.md"),
+            &inner.join(".autofork/forks/shared.md"),
             "---\nfork: true\n---\ninner body",
         );
         write(
-            &inner.join(".forksan/forks/local.md"),
+            &inner.join(".autofork/forks/local.md"),
             "---\nfork: true\n---\nlocal",
         );
         write(
-            &home.join(".forksan/forks/shared.md"),
+            &home.join(".autofork/forks/shared.md"),
             "---\nfork: true\n---\nhome body",
         );
         write(
-            &home.join(".forksan/forks/user.md"),
+            &home.join(".autofork/forks/user.md"),
             "---\nfork: true\n---\nuser",
         );
         fs::create_dir_all(&inner).unwrap();
 
-        let (entries, warnings) = discover_forks(&inner, Some(&home.join(".forksan/forks")));
+        let (entries, warnings) = discover_forks(&inner, Some(&home.join(".autofork/forks")));
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["local", "shared", "user"]);
         let shared = entries.iter().find(|e| e.name == "shared").unwrap();
@@ -268,9 +268,9 @@ mod tests {
     fn invalid_yaml_is_skipped_with_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("p");
-        write(&root.join(".forksan/forks/bad.md"), "---\n: [oops\n---\nb");
+        write(&root.join(".autofork/forks/bad.md"), "---\n: [oops\n---\nb");
         write(
-            &root.join(".forksan/forks/good.md"),
+            &root.join(".autofork/forks/good.md"),
             "---\nfork: true\n---\nfine",
         );
         let (entries, warnings) = discover_forks(&root, None);
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn no_forksan_dir_is_empty() {
+    fn no_autofork_dir_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let (entries, warnings) = discover_forks(tmp.path(), None);
         assert!(entries.is_empty());

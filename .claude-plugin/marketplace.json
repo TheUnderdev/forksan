@@ -1,12 +1,12 @@
 {
-  "name": "forksan",
+  "name": "autofork",
   "owner": {
     "name": "TheUnderdev",
     "url": "https://github.com/TheUnderdev"
   },
   "plugins": [
     {
-      "name": "forksan",
+      "name": "autofork",
       "source": "./plugin",
       "description": "Forks for Claude Code: at idle and context-threshold moments your session spawns background fork subagents that inherit its context and report back."
     }

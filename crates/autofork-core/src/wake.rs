@@ -6,12 +6,12 @@
 //! The parent model is told to spawn each fork with a prompt that makes the
 //! *fork* read the fork file — the parent must never read it itself.
 
-/// The greppable marker every wake block carries (`source: forksan`). The
+/// The greppable marker every wake block carries (`source: autofork`). The
 /// payload builder emits it and the continuation sniffer anchors on it, so the
 /// two can never drift. It survives Claude Code wrapping the payload in a
 /// system-reminder / task-notification envelope because it appears verbatim
 /// inside the reminder text.
-pub const WAKE_MARKER: &str = "source: forksan";
+pub const WAKE_MARKER: &str = "source: autofork";
 
 /// The prefix Claude Code uses for a fork-completion (task) notification the
 /// session receives as a non-waking continuation.
@@ -77,7 +77,7 @@ fn root_block(
     project_root: &str,
 ) -> String {
     format!(
-        "---\nsource: forksan\ndue: {name} (trigger: {trigger})\n---\n\
+        "---\nsource: autofork\ndue: {name} (trigger: {trigger})\n---\n\
          Spawn a background fork subagent now: use the Agent tool with subagent_type \"fork\" \
          and this prompt: \"{prompt}\" Do not read that file yourself — only the fork reads \
          it.{overlap}",
@@ -101,7 +101,7 @@ fn dependent_block(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "---\nsource: forksan\ndue: {name} (trigger: {trigger}) — after {preds}\n---\n\
+        "---\nsource: autofork\ndue: {name} (trigger: {trigger}) — after {preds}\n---\n\
          Do not spawn fork '{name}' yet. After {preds} finish and you receive their \
          completion notifications, spawn a background fork subagent: use the Agent tool with \
          subagent_type \"fork\" and this prompt: \"{prompt} This fork runs after {preds}; \
@@ -206,20 +206,20 @@ mod tests {
         ));
         assert!(looks_like_continuation("  \n<task-notification>x"));
         assert!(looks_like_continuation(
-            "---\nsource: forksan\ndue: journal (trigger: idle)\n---\nSpawn a fork"
+            "---\nsource: autofork\ndue: journal (trigger: idle)\n---\nSpawn a fork"
         ));
         assert!(!looks_like_continuation(
             "please refactor the config parser"
         ));
         assert!(!looks_like_continuation(
-            "what does source mean in forksan?"
+            "what does source mean in autofork?"
         ));
     }
 
     #[test]
     fn single_root_block() {
         let p = build_wake_payload("sid-1", "conv-1", "/proj", &[due("journal", &[], false)]);
-        assert!(p.contains("---\nsource: forksan\ndue: journal (trigger: idle)\n---\n"));
+        assert!(p.contains("---\nsource: autofork\ndue: journal (trigger: idle)\n---\n"));
         assert!(p.contains("subagent_type \"fork\""));
         assert!(p.contains("Read the file /x/journal.md"));
         assert!(p.contains("parent session sid-1"));

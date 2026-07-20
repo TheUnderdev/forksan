@@ -1,4 +1,4 @@
-//! forksan-core: the tool-agnostic semantics of forksan.
+//! autofork-core: the tool-agnostic semantics of autofork.
 //!
 //! Everything in this crate is synchronous and side-effect-light so the full
 //! semantic surface (frontmatter parsing, moment matching, dependency

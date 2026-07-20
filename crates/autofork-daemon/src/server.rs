@@ -3,11 +3,11 @@
 //! long poll) before its single response is written.
 
 use crate::daemon::Daemon;
-use forksan_core::protocol::{
+use autofork_core::protocol::{
     encode, ErrorCode, ForkInfo, Request, RequestBody, Response, ResponseBody, RunInfo,
     SessionInfo, StatusInfo,
 };
-use forksan_core::PROTO_VERSION;
+use autofork_core::PROTO_VERSION;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -148,7 +148,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             cwd,
         } => {
             let (entries, warnings) =
-                forksan_core::discovery::discover_forks(&cwd, Some(&daemon.user_forks_root()));
+                autofork_core::discovery::discover_forks(&cwd, Some(&daemon.user_forks_root()));
             let items = entries
                 .into_iter()
                 .map(|e| ForkInfo {

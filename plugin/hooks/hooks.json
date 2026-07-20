@@ -1,5 +1,5 @@
 {
-  "description": "forksan: fork subagents spawned at idle/context moments via an asyncRewake Stop hook",
+  "description": "autofork: fork subagents spawned at idle/context moments via an asyncRewake Stop hook",
   "hooks": {
     "Setup": [
       {
@@ -9,7 +9,7 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/bootstrap.sh\"",
             "timeout": 600,
-            "statusMessage": "Bootstrapping forksan"
+            "statusMessage": "Bootstrapping autofork"
           }
         ]
       }
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/autofork-hook.sh\" session-start",
             "timeout": 20
           }
         ]
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" user-prompt-submit",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/autofork-hook.sh\" user-prompt-submit",
             "timeout": 10
           }
         ]
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh stop-wait",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/autofork-hook.sh stop-wait",
             "asyncRewake": true,
             "timeout": 14400
           }
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" session-end",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/autofork-hook.sh\" session-end",
             "timeout": 30
           }
         ]

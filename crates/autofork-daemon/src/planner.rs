@@ -10,13 +10,13 @@
 //! wake-issuance).
 
 use crate::daemon::{now, Daemon};
-use forksan_core::config::Config;
-use forksan_core::frontmatter::{ForkParse, ForkRunOn};
-use forksan_core::moments::{match_moments, ForkMoment};
-use forksan_core::schedule::{resolve_deps, Selected};
-use forksan_core::store::SessionRow;
-use forksan_core::tags::tags_allowed;
-use forksan_core::wake::{build_wake_payload, DueFork};
+use autofork_core::config::Config;
+use autofork_core::frontmatter::{ForkParse, ForkRunOn};
+use autofork_core::moments::{match_moments, ForkMoment};
+use autofork_core::schedule::{resolve_deps, Selected};
+use autofork_core::store::SessionRow;
+use autofork_core::tags::tags_allowed;
+use autofork_core::wake::{build_wake_payload, DueFork};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ impl Selected for SelectedFork {
 /// the session's roster.
 pub fn refresh_roster(daemon: &Arc<Daemon>, session_id: &str, cwd: &Path) {
     let (entries, _) =
-        forksan_core::discovery::discover_forks(cwd, Some(&daemon.user_forks_root()));
+        autofork_core::discovery::discover_forks(cwd, Some(&daemon.user_forks_root()));
     let store = daemon.store.lock().unwrap();
     let t = now();
     for entry in entries {
@@ -173,7 +173,7 @@ pub fn select_forks(
 }
 
 fn parse_fork(name: &str, content: &str) -> ForkParse {
-    forksan_core::frontmatter::parse_fork_file(name, content)
+    autofork_core::frontmatter::parse_fork_file(name, content)
 }
 
 /// Given the forks selected to fire, stamp their throttles (per-fork and

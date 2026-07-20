@@ -2,12 +2,12 @@ mod client;
 mod commands;
 mod hook;
 
+use autofork_core::config::Paths;
 use clap::{Parser, Subcommand};
-use forksan_core::config::Paths;
 
 #[derive(Parser)]
 #[command(
-    name = "forksan",
+    name = "autofork",
     version,
     about = "Forks for Claude Code: throwaway forked-context runs at lifecycle moments"
 )]
@@ -34,7 +34,7 @@ enum Command {
     },
     /// Print the spawn instruction for a fork (by name, or every fork carrying
     /// `--tag`) to paste into an interactive Claude Code session. v0.5 forks
-    /// run as fork subagents, so forksan can no longer spawn them itself.
+    /// run as fork subagents, so autofork can no longer spawn them itself.
     Run {
         /// Fork name (omit when using --tag).
         name: Option<String>,
@@ -61,7 +61,7 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let Some(paths) = Paths::from_env() else {
-        eprintln!("forksan: cannot determine home directory");
+        eprintln!("autofork: cannot determine home directory");
         std::process::exit(1);
     };
 
@@ -77,7 +77,7 @@ fn main() {
 }
 
 fn stop_daemon(paths: &Paths, drain: bool) -> Result<(), String> {
-    use forksan_core::protocol::RequestBody;
+    use autofork_core::protocol::RequestBody;
     match client::Client::connect(paths, std::time::Duration::from_secs(5)) {
         Ok(mut c) => {
             let _ = c
@@ -95,7 +95,7 @@ fn stop_daemon(paths: &Paths, drain: bool) -> Result<(), String> {
 
 fn exit_on_err(result: Result<(), String>) {
     if let Err(e) = result {
-        eprintln!("forksan: {e}");
+        eprintln!("autofork: {e}");
         std::process::exit(1);
     }
 }

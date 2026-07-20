@@ -2,9 +2,9 @@
 //! when needed (flock-serialized against racing siblings), with per-call
 //! timeouts so hook paths never blow their budgets.
 
-use forksan_core::config::Paths;
-use forksan_core::protocol::{encode, Event, Request, RequestBody, Response, ResponseBody};
-use forksan_core::PROTO_VERSION;
+use autofork_core::config::Paths;
+use autofork_core::protocol::{encode, Event, Request, RequestBody, Response, ResponseBody};
+use autofork_core::PROTO_VERSION;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -176,10 +176,10 @@ fn flock_until(path: &Path, deadline: Instant) -> Option<std::fs::File> {
     }
 }
 
-/// The daemon binary: `forksan-daemon` next to the current executable.
+/// The daemon binary: `autofork-daemon` next to the current executable.
 fn daemon_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join("forksan-daemon");
+    let candidate = exe.parent()?.join("autofork-daemon");
     candidate.is_file().then_some(candidate)
 }
 
@@ -214,7 +214,7 @@ fn spawn_daemon_locked(paths: &Paths, deadline: Instant) -> Result<(), ClientErr
 
     let Some(bin) = daemon_binary() else {
         return Err(ClientError::Protocol(
-            "forksan-daemon binary not found next to the CLI".into(),
+            "autofork-daemon binary not found next to the CLI".into(),
         ));
     };
     let log_path = paths.daemon_log();

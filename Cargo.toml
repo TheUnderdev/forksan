@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/forksan-core", "crates/forksan-daemon", "crates/forksan"]
+members = ["crates/autofork-core", "crates/autofork-daemon", "crates/autofork"]
 
 [workspace.package]
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["TheUnderdev <me@theunder.dev>"]
-repository = "https://github.com/TheUnderdev/forksan"
+repository = "https://github.com/TheUnderdev/autofork"
 
 [workspace.dependencies]
-forksan-core = { path = "crates/forksan-core" }
+autofork-core = { path = "crates/autofork-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

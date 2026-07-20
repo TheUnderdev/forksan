@@ -1,6 +1,6 @@
 [package]
-name = "forksan"
-description = "forksan CLI: Claude Code hook entrypoint and daemon control"
+name = "autofork-daemon"
+description = "The autofork daemon: session tracking, fork moments, fork execution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,15 +8,16 @@ authors.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "forksan"
+name = "autofork-daemon"
 path = "src/main.rs"
 
 [dependencies]
-forksan-core.workspace = true
+autofork-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-clap.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

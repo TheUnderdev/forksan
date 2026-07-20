@@ -1,7 +1,7 @@
-# forksan
+# autofork
 
 **Forks for Claude Code.** When your session goes idle — or its context crosses a threshold —
-forksan has the session's own model spawn *forks*: background **fork subagents** that inherit the
+autofork has the session's own model spawn *forks*: background **fork subagents** that inherit the
 full conversation, do work with tools, and report back, all without interrupting you.
 
 Think of a fork as a background thought your agent has while you're away: update the project
@@ -14,9 +14,9 @@ the fork's report arriving as a completion notification your agent relays when i
 
 ## How a fork fires (v0.5)
 
-forksan no longer runs forks as headless subprocesses. Instead:
+autofork no longer runs forks as headless subprocesses. Instead:
 
-1. When a turn ends, an **asyncRewake `Stop` hook** long-polls the forksan daemon in the
+1. When a turn ends, an **asyncRewake `Stop` hook** long-polls the autofork daemon in the
    background without blocking your session.
 2. When forks come due (an idle deadline elapses, or a context threshold was crossed), the daemon
    answers the poll with a **wake payload** and the hook exits 2 — which wakes the idle session and
@@ -35,14 +35,14 @@ and model** — there is nothing to grant or override.
 
 ## Requirements
 
-forksan v0.5+ needs a Claude Code version whose Agent tool supports `subagent_type: "fork"` in
+autofork v0.5+ needs a Claude Code version whose Agent tool supports `subagent_type: "fork"` in
 interactive sessions:
 
 - **Claude Code >= 2.1.161** — the fork subagent is enabled by default (recommended).
 - **2.1.117 – 2.1.160** — it exists but is gated; export `CLAUDE_CODE_FORK_SUBAGENT=1`.
-- **< 2.1.117** — no fork subagent; forksan v0.5 can't run forks.
+- **< 2.1.117** — no fork subagent; autofork v0.5 can't run forks.
 
-`forksan doctor` checks your `claude --version` against these thresholds.
+`autofork doctor` checks your `claude --version` against these thresholds.
 
 ### If wakes report the fork type unavailable
 
@@ -65,7 +65,7 @@ disclosure mechanism, is the remedy.)
 > the env pin above — *not* a custom `~/.claude/agents/fork.md`. A custom agent named `fork` does not
 > inherit the conversation (only the built-in type does) and shadows the real one, so its "report"
 > will show no knowledge of your session. Wakes are instructed never to create one; if you suspect an
-> impostor slipped in (a fork "ran" but its report is context-blind), run `forksan doctor` — it flags
+> impostor slipped in (a fork "ran" but its report is context-blind), run `autofork doctor` — it flags
 > `fork.md` under `.claude/agents/`. Delete it.
 
 ## Install
@@ -73,8 +73,8 @@ disclosure mechanism, is the remedy.)
 From the plugin marketplace:
 
 ```
-/plugin marketplace add TheUnderdev/forksan
-/plugin install forksan@forksan
+/plugin marketplace add TheUnderdev/autofork
+/plugin install autofork@autofork
 ```
 
 On first use a bootstrap step downloads the prebuilt binary for your platform from GitHub
@@ -85,11 +85,11 @@ For local development: `claude --plugin-dir ./plugin` inside this repo.
 
 ## Writing forks
 
-Forks live in `.forksan/forks/`, discovered upward from your project directory plus the
-user-level `~/.forksan/forks/`. Two layouts, mix freely (subfolders are just organization):
+Forks live in `.autofork/forks/`, discovered upward from your project directory plus the
+user-level `~/.autofork/forks/`. Two layouts, mix freely (subfolders are just organization):
 
 ```
-.forksan/forks/
+.autofork/forks/
 ├── journal.md              # a fork named "journal"
 ├── style-guide.md          # a companion NOTE (no `fork: true`) — not a fork
 ├── maintenance/
@@ -113,10 +113,10 @@ Review the session so far and update NOTES.md with any durable decisions,
 open questions, and next steps. Keep it under 200 lines.
 ```
 
-Since v0.5, `.forksan/forks/` may hold arbitrary companion `.md` files (reference material a fork's
+Since v0.5, `.autofork/forks/` may hold arbitrary companion `.md` files (reference material a fork's
 body tells it to read, for instance). Only files marked `fork: true` are forks; anything else is
 skipped. As a guard rail, a file that looks like a fork (carries `run_on`, `throttle`, `tags`,
-`after`, `overlap`, `description`, …) but lacks the marker produces a warning in `forksan forks`, so
+`after`, `overlap`, `description`, …) but lacks the marker produces a warning in `autofork forks`, so
 a missing marker can't silently disable a real fork. `fork: false` is an explicit, silent opt-out.
 
 ### Frontmatter reference
@@ -124,7 +124,7 @@ a missing marker can't silently disable a real fork. `fork: false` is an explici
 | Key | Values | Default |
 |---|---|---|
 | `fork` | `true` — **required** on every fork | — |
-| `description` | free text, for humans (`forksan forks`) | — |
+| `description` | free text, for humans (`autofork forks`) | — |
 | `run_on` | list of moments, see below | `[idle]` |
 | `throttle` | min gap between runs: `30m`, `2h`, `90` (seconds) | none |
 | `after` | fork name(s) to run after: `journal`, `[a, b]` | — |
@@ -138,7 +138,7 @@ Moments for `run_on`:
 - `context_tokens: 150000` / `context_used: 80%` / `context_left: 20000` — context-size thresholds,
   each firing at most once per session
 
-Unknown keys are ignored; invalid values warn and fall back to defaults (`forksan forks` shows the
+Unknown keys are ignored; invalid values warn and fall back to defaults (`autofork forks` shows the
 warnings). Fork bodies should be **idempotent** — a fork may fire on any idle pause.
 
 **Once per pause.** An idle-triggered fork fires **at most once per idle pause** (restoring the
@@ -161,21 +161,21 @@ skip spawning it if a previous run of that fork is still among its running backg
 ## CLI
 
 ```
-forksan status          # daemon, sessions, recent wakes
-forksan forks           # forks visible from here, with warnings
-forksan run <name>      # print the spawn instruction to paste into an interactive session
-forksan run --tag <tag> # print instructions for every fork carrying <tag>
-forksan logs [-f]       # daemon log
-forksan doctor          # install checks
-forksan stop-daemon     # retire the daemon (it restarts on the next event)
+autofork status          # daemon, sessions, recent wakes
+autofork forks           # forks visible from here, with warnings
+autofork run <name>      # print the spawn instruction to paste into an interactive session
+autofork run --tag <tag> # print instructions for every fork carrying <tag>
+autofork logs [-f]       # daemon log
+autofork doctor          # install checks
+autofork stop-daemon     # retire the daemon (it restarts on the next event)
 ```
 
-`forksan run` can no longer spawn a fork itself (forks are subagents of an interactive session); it
+`autofork run` can no longer spawn a fork itself (forks are subagents of an interactive session); it
 prints the wake-style spawn instruction for you to paste into a live session.
 
 ## Configuration
 
-`~/.forksan/config.toml`, overridable per project in `<project>/.forksan/config.toml`:
+`~/.autofork/config.toml`, overridable per project in `<project>/.autofork/config.toml`:
 
 ```toml
 default_idle_deadline = "10m"  # bare `idle` deadline; 0 disables idle forks
@@ -206,9 +206,9 @@ selection time:
 
 Two sources feed the filter, per key:
 
-- **Per session** — the environment variables `FORKSAN_ENABLE_TAGS` and `FORKSAN_DISABLE_TAGS`
+- **Per session** — the environment variables `AUTOFORK_ENABLE_TAGS` and `AUTOFORK_DISABLE_TAGS`
   (comma-separated), read from the Claude Code process env by the hook. Set them per project/shell to
-  scope a session (`FORKSAN_DISABLE_TAGS=noisy claude`).
+  scope a session (`AUTOFORK_DISABLE_TAGS=noisy claude`).
 - **Defaults** — the `enable_tags` / `disable_tags` config keys above (project layer over home
   layer). A session's env value overrides the config default for that key.
 
@@ -226,7 +226,7 @@ stamped at **wake-issuance** (when the daemon answers the poll), not at fork com
 
 - **Every fork is a real model call** billed to your Claude Code account. Because a fork inherits the
   parent prefix, the *marginal* cost is dominated by cheap cache reads (~99% reuse measured) plus the
-  fork's own work. Use `throttle`, tight `run_on` lists, and `forksan status` to keep it deliberate.
+  fork's own work. Use `throttle`, tight `run_on` lists, and `autofork status` to keep it deliberate.
 - "Once per session" latches (context thresholds) reset when a session is resumed — Claude Code
   assigns resumed sessions a new id, so each resume leg counts fresh.
 - The transcript-based context gauge parses an internal Claude Code format; if it changes, the
@@ -238,7 +238,7 @@ stamped at **wake-issuance** (when the daemon answers the poll), not at fork com
   opportunity is simply missed — the next turn re-arms it. A hook never wedges or errors a session.
 - A session whose Claude process dies (killed terminal, restart) is closed automatically: its parked
   poll drops, and after a short grace with no new event the daemon marks it closed. A stray open
-  session that crashed mid-turn shows a `[stale?]` hint in `forksan status`.
+  session that crashed mid-turn shows a `[stale?]` hint in `autofork status`.
 
 ## v0.4 → v0.5 migration
 
@@ -250,7 +250,7 @@ the session's own model.
 - **Default `run_on`** changed from `[idle, compact]` to `[idle]`.
 - **Dropped moments.** `compact`, `session_start`, `session_end`, `manual_stop`, and `boot` are no
   longer supported — they are parsed but warned and ignored, and a fork whose only moments are
-  unsupported never fires (with a visible warning in `forksan forks`). Supported moments: `idle`,
+  unsupported never fires (with a visible warning in `autofork forks`). Supported moments: `idle`,
   `idle:<dur>`, and the three `context_*` thresholds.
 - **Ignored frontmatter keys.** `delivery`, `model`, `allowed_tools`, and `permission_mode` are
   parsed-and-ignored with a warning: delivery is native, and a fork inherits the session's model and
@@ -266,7 +266,7 @@ the session's own model.
 
 ## Other tools
 
-The `.forksan/forks/` format is deliberately tool-agnostic; forksan is the reference implementation
+The `.autofork/forks/` format is deliberately tool-agnostic; autofork is the reference implementation
 for Claude Code. Other agent harnesses are welcome to read the same fork definitions natively — the
 format spec above is the whole contract.
 

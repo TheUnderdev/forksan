@@ -1,14 +1,14 @@
 {
-  "name": "forksan",
-  "displayName": "forksan",
-  "version": "0.5.5",
+  "name": "autofork",
+  "displayName": "autofork",
+  "version": "0.6.0",
   "description": "Forks for Claude Code: at idle and context-threshold moments an asyncRewake Stop hook has your session spawn background fork subagents that inherit its context and report back.",
   "author": {
     "name": "TheUnderdev",
     "url": "https://github.com/TheUnderdev"
   },
-  "homepage": "https://github.com/TheUnderdev/forksan",
-  "repository": "https://github.com/TheUnderdev/forksan",
+  "homepage": "https://github.com/TheUnderdev/autofork",
+  "repository": "https://github.com/TheUnderdev/autofork",
   "license": "MIT",
   "keywords": ["forks", "background", "automation", "lifecycle", "hooks"]
 }

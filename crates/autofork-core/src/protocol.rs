@@ -28,9 +28,9 @@ pub enum RequestBody {
     /// timers, then block until forks are due (a `Wake`) or the wait is
     /// cancelled/the daemon retires (a `Waited`).
     StopWait(Event),
-    /// Daemon + session + run status (the `forksan status` command).
+    /// Daemon + session + run status (the `autofork status` command).
     Status,
-    /// Discovered forks for a project (the `forksan forks` command).
+    /// Discovered forks for a project (the `autofork forks` command).
     ListForks { project_root: PathBuf, cwd: PathBuf },
     /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
     /// Frozen shape — never change.
@@ -51,10 +51,10 @@ pub struct Event {
     /// The session's model id (SessionStart provides it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Per-session enable (whitelist) tag filter, from `FORKSAN_ENABLE_TAGS`.
+    /// Per-session enable (whitelist) tag filter, from `AUTOFORK_ENABLE_TAGS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_tags: Option<Vec<String>>,
-    /// Per-session disable (blocklist) tag filter, from `FORKSAN_DISABLE_TAGS`.
+    /// Per-session disable (blocklist) tag filter, from `AUTOFORK_DISABLE_TAGS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_tags: Option<Vec<String>>,
     /// For a PromptSubmit: whether this is genuine user activity (`Some(true)`)

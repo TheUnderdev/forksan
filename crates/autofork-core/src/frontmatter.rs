@@ -1,7 +1,7 @@
 //! The fork definition format: a markdown file with YAML frontmatter.
 //!
 //! Since v0.5 a fork MUST carry an explicit `fork: true` marker in its
-//! frontmatter. `.forksan/forks/` may hold arbitrary companion `.md` files
+//! frontmatter. `.autofork/forks/` may hold arbitrary companion `.md` files
 //! (reference notes a fork body reads, etc.); only files marked `fork: true`
 //! are forks. Files without the marker are skipped — silently for plain
 //! notes, with a migration warning when they carry fork-like frontmatter.
@@ -20,7 +20,7 @@ use serde::Deserialize;
 /// A parsed fork definition (frontmatter only; the body is the prompt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkDef {
-    /// Human documentation only — forksan never feeds this to a model or an
+    /// Human documentation only — autofork never feeds this to a model or an
     /// embedding index.
     pub description: Option<String>,
     /// The fork moments this fork fires at.

@@ -1,5 +1,5 @@
-//! Configuration: `<project_root>/.forksan/config.toml` overrides
-//! `~/.forksan/config.toml` overrides built-in defaults. Keys that only make
+//! Configuration: `<project_root>/.autofork/config.toml` overrides
+//! `~/.autofork/config.toml` overrides built-in defaults. Keys that only make
 //! sense globally are ignored (with a warning) when set at project level.
 //!
 //! v0.5 removed a batch of keys tied to the old subprocess runner
@@ -164,14 +164,14 @@ pub fn load_config(project_root: Option<&Path>, home: Option<&Path>) -> (Config,
     let mut cfg = Config::default();
     let mut warnings = Vec::new();
     if let Some(home) = home {
-        if let Some(raw) = load_layer(&home.join(".forksan/config.toml"), &mut warnings) {
+        if let Some(raw) = load_layer(&home.join(".autofork/config.toml"), &mut warnings) {
             apply_layer(&mut cfg, raw, false, &mut warnings);
         }
     }
     if let Some(root) = project_root {
-        let path = root.join(".forksan/config.toml");
+        let path = root.join(".autofork/config.toml");
         // Don't double-apply when the "project" root is the home dir itself.
-        if home.map(|h| h.join(".forksan/config.toml")) != Some(path.clone()) {
+        if home.map(|h| h.join(".autofork/config.toml")) != Some(path.clone()) {
             if let Some(raw) = load_layer(&path, &mut warnings) {
                 apply_layer(&mut cfg, raw, true, &mut warnings);
             }
@@ -183,24 +183,24 @@ pub fn load_config(project_root: Option<&Path>, home: Option<&Path>) -> (Config,
     (cfg, warnings)
 }
 
-/// The user's home directory, honoring the `FORKSAN_HOME` test/dev override
-/// (which replaces the *`~/.forksan`* base, not `$HOME` itself).
-pub fn forksan_home_from_env() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("FORKSAN_HOME") {
+/// The user's home directory, honoring the `AUTOFORK_HOME` test/dev override
+/// (which replaces the *`~/.autofork`* base, not `$HOME` itself).
+pub fn autofork_home_from_env() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("AUTOFORK_HOME") {
         let dir = PathBuf::from(dir);
         if dir.is_absolute() {
             return Some(dir);
         }
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".forksan"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".autofork"))
 }
 
-/// The daemon's home base: `~/.forksan`.
-pub fn forksan_home(home: &Path) -> PathBuf {
-    home.join(".forksan")
+/// The daemon's home base: `~/.autofork`.
+pub fn autofork_home(home: &Path) -> PathBuf {
+    home.join(".autofork")
 }
 
-/// Paths under the forksan base dir (`~/.forksan` or `$FORKSAN_HOME`).
+/// Paths under the autofork base dir (`~/.autofork` or `$AUTOFORK_HOME`).
 pub struct Paths {
     pub base: PathBuf,
 }
@@ -210,16 +210,16 @@ impl Paths {
         Self { base }
     }
 
-    /// From the environment (`FORKSAN_HOME` override, else `$HOME/.forksan`).
+    /// From the environment (`AUTOFORK_HOME` override, else `$HOME/.autofork`).
     pub fn from_env() -> Option<Self> {
-        forksan_home_from_env().map(Self::new)
+        autofork_home_from_env().map(Self::new)
     }
 
-    /// The daemon socket path: `$FORKSAN_SOCKET` override, else
-    /// `$XDG_RUNTIME_DIR/forksan.sock` when set (kept short — the platform
+    /// The daemon socket path: `$AUTOFORK_SOCKET` override, else
+    /// `$XDG_RUNTIME_DIR/autofork.sock` when set (kept short — the platform
     /// caps `sun_path` around 100 bytes), else `<base>/run/daemon.sock`.
     pub fn socket(&self) -> PathBuf {
-        if let Some(p) = std::env::var_os("FORKSAN_SOCKET") {
+        if let Some(p) = std::env::var_os("AUTOFORK_SOCKET") {
             let p = PathBuf::from(p);
             if p.is_absolute() {
                 return p;
@@ -228,7 +228,7 @@ impl Paths {
         if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
             let dir = PathBuf::from(dir);
             if dir.is_absolute() {
-                return dir.join("forksan.sock");
+                return dir.join("autofork.sock");
             }
         }
         self.base.join("run/daemon.sock")
@@ -254,7 +254,7 @@ impl Paths {
 
     /// The user-level config layer lives at `<base>/config.toml`; the
     /// `load_config` home parameter expects the directory *containing*
-    /// `.forksan`, so this exposes the base for direct loading.
+    /// `.autofork`, so this exposes the base for direct loading.
     pub fn user_config(&self) -> PathBuf {
         self.base.join("config.toml")
     }
@@ -269,7 +269,7 @@ pub fn load_config_at(project_root: Option<&Path>, user_config: &Path) -> (Confi
         apply_layer(&mut cfg, raw, false, &mut warnings);
     }
     if let Some(root) = project_root {
-        let path = root.join(".forksan/config.toml");
+        let path = root.join(".autofork/config.toml");
         if path != user_config {
             if let Some(raw) = load_layer(&path, &mut warnings) {
                 apply_layer(&mut cfg, raw, true, &mut warnings);
@@ -292,15 +292,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = tmp.path().join("proj");
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::create_dir_all(proj.join(".autofork")).unwrap();
         fs::write(
-            home.join(".forksan/config.toml"),
+            home.join(".autofork/config.toml"),
             "default_idle_deadline = \"5m\"\nquiet_period = \"30m\"\n",
         )
         .unwrap();
         fs::write(
-            proj.join(".forksan/config.toml"),
+            proj.join(".autofork/config.toml"),
             "default_idle_deadline = 120\nquiet_period = \"1h\"\n",
         )
         .unwrap();
@@ -315,9 +315,9 @@ mod tests {
     fn deprecated_keys_warn_but_dont_error() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
         fs::write(
-            home.join(".forksan/config.toml"),
+            home.join(".autofork/config.toml"),
             "claude_bin = \"claude-x\"\nconcurrency = 4\nrun_timeout = \"10m\"\nisolation = \"open\"\ncontext_window = 500000\n[models]\n\"m1\" = 100\n",
         )
         .unwrap();
@@ -344,15 +344,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = tmp.path().join("proj");
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::create_dir_all(proj.join(".autofork")).unwrap();
         fs::write(
-            home.join(".forksan/config.toml"),
+            home.join(".autofork/config.toml"),
             "enable_tags = [\"home\"]\ndisable_tags = [\"noisy\"]\n",
         )
         .unwrap();
         fs::write(
-            proj.join(".forksan/config.toml"),
+            proj.join(".autofork/config.toml"),
             "enable_tags = [\"ci\", \"review\"]\n",
         )
         .unwrap();
@@ -370,15 +370,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = tmp.path().join("proj");
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::create_dir_all(proj.join(".autofork")).unwrap();
         fs::write(
-            home.join(".forksan/config.toml"),
+            home.join(".autofork/config.toml"),
             "[tag_throttles]\nci = \"1h\"\nreview = \"30m\"\n",
         )
         .unwrap();
         fs::write(
-            proj.join(".forksan/config.toml"),
+            proj.join(".autofork/config.toml"),
             "[tag_throttles]\nci = 120\ndocs = \"10m\"\n",
         )
         .unwrap();
@@ -395,8 +395,8 @@ mod tests {
         assert_eq!(Config::default().wake_debounce_secs, 5);
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-        fs::write(home.join(".forksan/config.toml"), "wake_debounce = 0\n").unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
+        fs::write(home.join(".autofork/config.toml"), "wake_debounce = 0\n").unwrap();
         let (cfg, warnings) = load_config(None, Some(home));
         assert_eq!(cfg.wake_debounce_secs, 0);
         assert!(warnings.is_empty());
@@ -414,9 +414,9 @@ mod tests {
     fn invalid_values_warn_and_keep_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::create_dir_all(home.join(".autofork")).unwrap();
         fs::write(
-            home.join(".forksan/config.toml"),
+            home.join(".autofork/config.toml"),
             "default_idle_deadline = \"soon\"\n",
         )
         .unwrap();

@@ -1,4 +1,4 @@
-//! `forksan hook <event>`: the Claude Code hook entrypoint. Reads the hook
+//! `autofork hook <event>`: the Claude Code hook entrypoint. Reads the hook
 //! JSON from stdin and forwards it to the daemon.
 //!
 //! The Stop hook (`stop-wait`) is an asyncRewake command: it long-polls the
@@ -7,9 +7,9 @@
 //! failure — exits 0 so a hook never breaks or wedges the session.
 
 use crate::client::{spawn_daemon_detached, Client};
-use forksan_core::config::Paths;
-use forksan_core::project::project_root;
-use forksan_core::protocol::{Event, EventKind, RequestBody, ResponseBody};
+use autofork_core::config::Paths;
+use autofork_core::project::project_root;
+use autofork_core::protocol::{Event, EventKind, RequestBody, ResponseBody};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,8 +51,8 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     // Recursion guard, kept as zero-cost defense in depth: fork subagents emit
     // SubagentStop, not Stop, so they never reach the trigger path — but if a
     // fork's environment ever carried these vars, do nothing.
-    if std::env::var_os("FORKSAN_FORK").is_some()
-        || std::env::var_os("FORKSAN_SESSION_ID").is_some()
+    if std::env::var_os("AUTOFORK_FORK").is_some()
+        || std::env::var_os("AUTOFORK_SESSION_ID").is_some()
     {
         return Some(());
     }
@@ -66,8 +66,8 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     let root = project_root(&cwd);
 
     // Per-session tag filter, inherited from the Claude Code process env.
-    let enable_tags = tags_from_env("FORKSAN_ENABLE_TAGS");
-    let disable_tags = tags_from_env("FORKSAN_DISABLE_TAGS");
+    let enable_tags = tags_from_env("AUTOFORK_ENABLE_TAGS");
+    let disable_tags = tags_from_env("AUTOFORK_DISABLE_TAGS");
 
     let event = |ev: EventKind| Event {
         event: ev,
@@ -104,7 +104,7 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             ev.waking = input
                 .prompt
                 .as_deref()
-                .map(|p| !forksan_core::wake::looks_like_continuation(p));
+                .map(|p| !autofork_core::wake::looks_like_continuation(p));
             let _ = client.request(RequestBody::Event(ev));
         }
         HookKind::StopWait => {
