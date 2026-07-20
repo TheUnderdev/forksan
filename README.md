@@ -67,7 +67,7 @@ open questions, and next steps. Keep it under 200 lines.
 | `throttle` | min gap between runs: `30m`, `2h`, `90` (seconds) | none |
 | `after` | fork name(s): `journal`, `[a, b]`, or maps `{fork: name, context: parent\|fork}` | — |
 | `overlap` | `true` to allow two runs of this fork at once | `false` |
-| `model` | model override for the fork run | session default |
+| `model` | model override for the fork run (window-guarded, see below) | session default |
 | `tags` | labels for the enable/disable filter: `ci`, `[ci, review]` | — |
 | `allowed_tools` | permission rules granted to the fork: `Write`, `[Write, "Bash(git add:*)"]` | — (read-only) |
 | `permission_mode` | `default` \| `acceptEdits` \| `bypassPermissions` | config, else none |
@@ -102,6 +102,13 @@ simply cancelled. The fork fires again at its next moment — the next idle time
 around after you've prompted again, which is exactly when the previous run's report gets
 injected into your session — so the next run inherits a parent context that already contains
 the previous result. Set `overlap: true` to allow concurrent runs.
+
+`model` overrides the model for the fork run, but is **window-guarded**: forking a large
+session onto a smaller-window model would overflow its context and hang until `run_timeout`.
+So when the session's tracked prompt already exceeds ~90% of the override model's context
+window (from `[models]`, or `context_window` if unlisted), forksan drops the override and runs
+the fork on the session's inherited model instead (logged at info). Before the first gauge
+reading the override always applies.
 
 ### Fork permissions
 
@@ -191,9 +198,9 @@ default_idle_deadline = "10m"  # bare `idle` deadline; 0 disables idle forks
 session_timeout = "12h"        # close sessions idle longer than this (boot sweep)
 quiet_period = "20m"           # daemon self-exit after this much nothing (global only)
 concurrency = 4                # parallel fork runs (leader always warms the cache alone first)
-fork_timeout = "10m"           # kill a fork run after this long
+run_timeout = "10m"            # kill a fork run after this long (alias: fork_timeout)
 claude_bin = "claude"          # global only
-context_window = 200000        # for context_used / context_left
+context_window = 200000        # for context_used / context_left; per-model overrides in [models]
 report_ttl = "7d"              # drop undelivered reports after this
 poll_budget_chars = 24000      # max report chars injected per turn
 enable_tags = ["ci"]           # default tag whitelist (see below)
@@ -201,9 +208,14 @@ disable_tags = ["noisy"]       # default tag blocklist (see below)
 permission_mode = "acceptEdits" # default fork --permission-mode; a fork's own key wins
 isolation = "open"             # "open" (full config, cache reuse) | "hermetic" (bare forks)
 
-[models]                       # per-model context windows
+[models]                       # per-model context windows (sonnet/haiku/opus pinned to 200000)
 "some-model-id" = 500000
 ```
+
+`run_timeout` bounds a single fork run; raise it for legitimately long forks (`fork_timeout` is
+an accepted alias). `[models]` maps a model id/alias to its context window; the common aliases
+`sonnet`, `haiku`, and `opus` are pre-pinned to 200000 so the `model:` override guard (below)
+stays correct even when you raise `context_window` for a large default model.
 
 `isolation` controls how much of your setup a fork inherits. `open` (the default) loads your
 full config so fork requests share your session's shape and reuse the prompt cache; forks then

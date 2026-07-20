@@ -53,6 +53,7 @@ esac
 "#;
 
 /// One captured fork subprocess invocation.
+#[derive(Clone)]
 struct Invocation {
     prompt: String,
     args: Vec<String>,
@@ -668,6 +669,64 @@ fn hermetic_isolation_includes_isolation_flags() {
             inv.args
         );
     }
+}
+
+#[test]
+fn model_override_dropped_when_session_exceeds_its_window() {
+    let mut h = Harness::new("1s");
+    // A tiny-window model and a huge-window one; the session is 2000 tokens.
+    h.append_config("[models]\ntiny = 1000\nbig = 1000000");
+    h.write_fork(
+        "small.md",
+        "---\nrun_on: [idle]\nmodel: tiny\n---\nTINY WORK",
+    );
+    h.write_fork("large.md", "---\nrun_on: [idle]\nmodel: big\n---\nBIG WORK");
+    h.start_daemon();
+
+    // Record a 2000-token prompt gauge via the transcript on Stop.
+    let transcript = h.project.join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":2000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+"#,
+    )
+    .unwrap();
+    let mut start = h.event(EventKind::SessionStart, "s1");
+    start.transcript_path = Some(transcript.clone());
+    assert_ack(h.send_event(start));
+    let mut stop = h.event(EventKind::Stop, "s1");
+    stop.transcript_path = Some(transcript.clone());
+    assert_ack(h.send_event(stop));
+
+    // At the 1s idle both forks fire.
+    let start = Instant::now();
+    let (tiny, big) = loop {
+        let invs = h.invocations();
+        let tiny = invs
+            .iter()
+            .find(|i| i.prompt.contains("TINY WORK"))
+            .cloned();
+        let big = invs.iter().find(|i| i.prompt.contains("BIG WORK")).cloned();
+        if let (Some(t), Some(b)) = (tiny, big) {
+            break (t, b);
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "forks never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let model_of = |i: &Invocation| -> Option<String> {
+        i.args
+            .iter()
+            .position(|a| a == "--model")
+            .and_then(|p| i.args.get(p + 1).cloned())
+    };
+    // 2000 > 90% of tiny's 1000 window: the override is dropped entirely.
+    assert_eq!(
+        model_of(&tiny),
+        None,
+        "tiny override should have been dropped"
+    );
+    // 2000 is well under big's window: the override is applied.
+    assert_eq!(model_of(&big).as_deref(), Some("big"));
 }
 
 #[test]

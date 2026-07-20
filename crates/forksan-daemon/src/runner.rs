@@ -75,6 +75,48 @@ fn is_resume_not_ready(err: &str) -> bool {
     err.contains("No conversation found")
 }
 
+/// The outcome of the model-override window guard.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelGuard<'a> {
+    /// Pass `--model <m>`.
+    Apply(&'a str),
+    /// No override configured; run on the session's inherited model.
+    Skip,
+    /// Override dropped: the prompt would overflow the override's window.
+    Dropped {
+        model: &'a str,
+        prompt_tokens: u64,
+        window: u64,
+    },
+}
+
+/// Guard a `model:` override against the override model's context window. A
+/// big session forked onto a smaller model overflows and hangs until the run
+/// timeout, so drop the override once the tracked prompt exceeds ~90% of that
+/// model's window. With no gauge yet (`prompt_tokens` unknown) the override
+/// applies as before.
+fn guard_model_override<'a>(
+    def_model: Option<&'a str>,
+    prompt_tokens: Option<u64>,
+    cfg: &Config,
+) -> ModelGuard<'a> {
+    let Some(model) = def_model else {
+        return ModelGuard::Skip;
+    };
+    if let Some(pt) = prompt_tokens {
+        let window = cfg.window_for(Some(model));
+        // pt > 0.9 * window, done in integers to avoid float rounding.
+        if pt.saturating_mul(10) > window.saturating_mul(9) {
+            return ModelGuard::Dropped {
+                model,
+                prompt_tokens: pt,
+                window,
+            };
+        }
+    }
+    ModelGuard::Apply(model)
+}
+
 /// The parsed shape of `claude -p --output-format json` stdout.
 #[derive(Debug, Default)]
 struct ClaudeResult {
@@ -207,6 +249,40 @@ pub async fn run_one_fork(
         &piped,
     );
 
+    // Model-override window guard: drop a `model:` override that the session
+    // is already too large for (it would overflow and hang until the run
+    // timeout). Uses the session's tracked prompt gauge; unknown = apply.
+    let prompt_tokens = {
+        let store = daemon.store.lock().unwrap();
+        store
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.prompt_tokens)
+    };
+    let model_flag: Option<&str> = match guard_model_override(
+        sel.def.model.as_deref(),
+        prompt_tokens,
+        cfg,
+    ) {
+        ModelGuard::Apply(m) => Some(m),
+        ModelGuard::Skip => None,
+        ModelGuard::Dropped {
+            model,
+            prompt_tokens,
+            window,
+        } => {
+            tracing::info!(
+                fork = %sel.name,
+                model,
+                prompt_tokens,
+                window,
+                "dropping model override: prompt exceeds ~90% of the override model's context window; running on the inherited model"
+            );
+            None
+        }
+    };
+
     // A fresh command per attempt (a retry consumes the previous one).
     let build_cmd = || {
         let mut cmd = tokio::process::Command::new(&cfg.claude_bin);
@@ -248,7 +324,7 @@ pub async fn run_one_fork(
                 .arg("--settings")
                 .arg(r#"{"disableAllHooks":true}"#);
         }
-        if let Some(model) = &sel.def.model {
+        if let Some(model) = model_flag {
             cmd.arg("--model").arg(model);
         }
         // Fork permissions: a headless fork can't answer prompts, so grant it
@@ -456,5 +532,55 @@ mod tests {
         // Tolerates leading noise lines.
         let noisy = format!("warning: something\n{out}");
         assert_eq!(parse_claude_output(&noisy).unwrap().result, "the report");
+    }
+
+    #[test]
+    fn model_override_window_guard() {
+        // Default map pins sonnet at 200k.
+        let cfg = Config::default();
+
+        // No override configured.
+        assert_eq!(
+            guard_model_override(None, Some(999_999), &cfg),
+            ModelGuard::Skip
+        );
+
+        // Under the window: applied.
+        assert_eq!(
+            guard_model_override(Some("sonnet"), Some(100_000), &cfg),
+            ModelGuard::Apply("sonnet")
+        );
+
+        // Over ~90% of the window: dropped.
+        assert_eq!(
+            guard_model_override(Some("sonnet"), Some(295_000), &cfg),
+            ModelGuard::Dropped {
+                model: "sonnet",
+                prompt_tokens: 295_000,
+                window: 200_000,
+            }
+        );
+
+        // Exactly at 90% is fine; just over it drops.
+        assert_eq!(
+            guard_model_override(Some("sonnet"), Some(180_000), &cfg),
+            ModelGuard::Apply("sonnet")
+        );
+        assert!(matches!(
+            guard_model_override(Some("sonnet"), Some(180_001), &cfg),
+            ModelGuard::Dropped { .. }
+        ));
+
+        // Unknown gauge: apply the override regardless.
+        assert_eq!(
+            guard_model_override(Some("sonnet"), None, &cfg),
+            ModelGuard::Apply("sonnet")
+        );
+
+        // Unknown model falls back to the default context window (200k here).
+        assert!(matches!(
+            guard_model_override(Some("mystery"), Some(500_000), &cfg),
+            ModelGuard::Dropped { .. }
+        ));
     }
 }

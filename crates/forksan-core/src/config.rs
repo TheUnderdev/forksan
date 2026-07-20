@@ -33,7 +33,8 @@ pub struct Config {
     pub quiet_period_secs: u64,
     /// Fork batch width after the leader ran alone.
     pub concurrency: usize,
-    /// Kill a fork run after this long (seconds).
+    /// Kill a fork run after this long (seconds). Config key `run_timeout`
+    /// (alias `fork_timeout`).
     pub fork_timeout_secs: u64,
     /// The Claude Code binary to run forks with.
     pub claude_bin: String,
@@ -73,7 +74,15 @@ impl Default for Config {
             fork_timeout_secs: 600,
             claude_bin: "claude".into(),
             context_window: 200_000,
-            models: BTreeMap::new(),
+            // Common override aliases pinned to their real windows, so the
+            // model-override window guard is right even when `context_window`
+            // is raised for a big default model. User `[models]` entries
+            // extend/override these.
+            models: BTreeMap::from([
+                ("sonnet".to_string(), 200_000),
+                ("haiku".to_string(), 200_000),
+                ("opus".to_string(), 200_000),
+            ]),
             report_ttl_secs: 7 * 86400,
             poll_budget_chars: 24_000,
             enable_tags: None,
@@ -102,6 +111,7 @@ struct RawConfig {
     quiet_period: Option<toml::Value>,
     concurrency: Option<usize>,
     fork_timeout: Option<toml::Value>,
+    run_timeout: Option<toml::Value>,
     claude_bin: Option<String>,
     context_window: Option<u64>,
     #[serde(default)]
@@ -149,7 +159,13 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     if let Some(s) = dur(&raw.quiet_period, "quiet_period") {
         cfg.quiet_period_secs = s;
     }
+    // `run_timeout` is the documented name for the fork-run kill timeout;
+    // `fork_timeout` remains an accepted alias. `run_timeout` wins if both
+    // appear in the same layer.
     if let Some(s) = dur(&raw.fork_timeout, "fork_timeout") {
+        cfg.fork_timeout_secs = s;
+    }
+    if let Some(s) = dur(&raw.run_timeout, "run_timeout") {
         cfg.fork_timeout_secs = s;
     }
     if let Some(s) = dur(&raw.report_ttl, "report_ttl") {
@@ -491,6 +507,43 @@ mod tests {
         let (cfg, warnings) = load_config(None, Some(home));
         assert_eq!(cfg.isolation, Isolation::Open);
         assert!(warnings.iter().any(|w| w.contains("isolation")));
+    }
+
+    #[test]
+    fn run_timeout_parses_and_aliases_fork_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+
+        // Default is unchanged at 600s.
+        assert_eq!(Config::default().fork_timeout_secs, 600);
+
+        fs::write(home.join(".forksan/config.toml"), "run_timeout = \"20m\"\n").unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert_eq!(cfg.fork_timeout_secs, 1200);
+        assert!(warnings.is_empty());
+
+        // The legacy `fork_timeout` alias still works.
+        fs::write(home.join(".forksan/config.toml"), "fork_timeout = 90\n").unwrap();
+        let (cfg, _) = load_config(None, Some(home));
+        assert_eq!(cfg.fork_timeout_secs, 90);
+    }
+
+    #[test]
+    fn default_models_map_pins_common_aliases() {
+        let cfg = Config::default();
+        assert_eq!(cfg.window_for(Some("sonnet")), 200_000);
+        assert_eq!(cfg.window_for(Some("haiku")), 200_000);
+        // A raised default window must not lift the pinned aliases.
+        let mut cfg = Config {
+            context_window: 1_000_000,
+            ..Config::default()
+        };
+        assert_eq!(cfg.window_for(Some("sonnet")), 200_000);
+        assert_eq!(cfg.window_for(Some("unknown-big")), 1_000_000);
+        // User entries still override the pins.
+        cfg.models.insert("sonnet".to_string(), 500_000);
+        assert_eq!(cfg.window_for(Some("sonnet")), 500_000);
     }
 
     #[test]
