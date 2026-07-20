@@ -2,17 +2,18 @@
 //!
 //! Pipeline (order matters): refresh discovery → queue
 //! roster → live re-read each rostered fork → match moments → skip-ran-after
-//! guard (boot sweep) → throttle → context/boot latch → dependency layering
-//! → execution (leader alone first for provider cache warming, then bounded
-//! concurrency; `after` chains sequential inside their root's slot).
+//! guard (boot sweep) → throttle → context/boot latch → dependency
+//! resolution → execution (a readiness-counted DAG: each fork runs once all
+//! its `after` dependencies finished, receiving their reports; the first
+//! root runs alone for provider cache warming, the rest under the
+//! concurrency cap).
 
 use crate::daemon::{now, Daemon};
 use crate::runner::{run_one_fork, Predecessor, SelectedFork};
 use forksan_core::frontmatter::parse_fork_file;
 use forksan_core::moments::{match_moments, ForkMoment};
-use forksan_core::schedule::layer_dependencies;
+use forksan_core::schedule::resolve_deps;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 
 /// Refresh discovery for a session's cwd and queue every visible fork onto
@@ -126,135 +127,134 @@ pub async fn run_moments(
         "fork moment firing"
     );
 
-    let (roots, children) = layer_dependencies(&selected);
-    let nodes = Arc::new(selected);
-    let children = Arc::new(children);
-
-    if let Some(tx) = spawned {
-        // Snapshot mode (PreCompact): every root spawns concurrently and the
-        // barrier fires once all subprocesses exist — no leader-first, no
-        // concurrency cap, so compaction can't outrun the snapshots.
-        let mut spawn_waits = Vec::new();
-        let mut joins = Vec::new();
-        for &root in &roots {
-            let (stx, srx) = tokio::sync::oneshot::channel();
-            spawn_waits.push(srx);
-            joins.push(tokio::spawn(run_chain(
-                daemon.clone(),
-                cfg.clone(),
-                session.session_id.clone(),
-                session.project_root.clone(),
-                session.cwd.clone(),
-                nodes.clone(),
-                children.clone(),
-                root,
-                None,
-                Some(stx),
-            )));
-        }
-        for w in spawn_waits {
-            let _ = w.await;
-        }
-        let _ = tx.send(());
-        for j in joins {
-            let _ = j.await;
-        }
-    } else {
-        // Leader runs alone first: the provider cache entry for the shared
-        // context prefix only exists once a first response begins.
-        if let Some(&leader) = roots.first() {
-            run_chain(
-                daemon.clone(),
-                cfg.clone(),
-                session.session_id.clone(),
-                session.project_root.clone(),
-                session.cwd.clone(),
-                nodes.clone(),
-                children.clone(),
-                leader,
-                None,
-                None,
-            )
-            .await;
-        }
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(cfg.concurrency));
-        let mut joins = Vec::new();
-        for &root in roots.iter().skip(1) {
-            let permit = semaphore.clone().acquire_owned().await;
-            let daemon = daemon.clone();
-            let cfg = cfg.clone();
-            let sid = session.session_id.clone();
-            let proot = session.project_root.clone();
-            let cwd = session.cwd.clone();
-            let nodes = nodes.clone();
-            let children = children.clone();
-            joins.push(tokio::spawn(async move {
-                let _permit = permit;
-                run_chain(
-                    daemon, cfg, sid, proot, cwd, nodes, children, root, None, None,
-                )
-                .await;
-            }));
-        }
-        for j in joins {
-            let _ = j.await;
-        }
-    }
+    let deps = resolve_deps(&selected);
+    run_plan(daemon, &cfg, &session, selected, deps, spawned).await;
 
     let store = daemon.store.lock().unwrap();
     let _ = store.set_forks_ran_at(session_id, now());
 }
 
-/// Run one fork, then its `after` dependents sequentially (each seeing this
-/// fork's report — or forking its session for `context: fork`). Boxed for
-/// recursion.
-#[allow(clippy::too_many_arguments)]
-fn run_chain(
-    daemon: Arc<Daemon>,
-    cfg: forksan_core::config::Config,
-    session_id: String,
-    project_root: std::path::PathBuf,
-    cwd: std::path::PathBuf,
-    nodes: Arc<Vec<SelectedFork>>,
-    children: Arc<Vec<Vec<usize>>>,
-    idx: usize,
-    predecessor: Option<Predecessor>,
+/// Execute a resolved plan: each fork runs as soon as all its dependencies
+/// finished (readiness counting), receiving their outcomes as predecessors.
+/// Without a barrier the first root runs alone (the provider cache entry for
+/// the shared context prefix only exists once a first response begins) and
+/// the rest respect the concurrency cap; in barrier mode (PreCompact) every
+/// root spawns immediately, uncapped, and `spawned` fires once all their
+/// subprocesses exist so compaction can't outrun the snapshots.
+async fn run_plan(
+    daemon: &Arc<Daemon>,
+    cfg: &forksan_core::config::Config,
+    session: &forksan_core::store::SessionRow,
+    nodes: Vec<SelectedFork>,
+    deps: Vec<Vec<usize>>,
     spawned: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(async move {
-        let sel = &nodes[idx];
-        let outcome = run_one_fork(
-            &daemon,
-            &cfg,
-            &session_id,
-            &project_root,
-            &cwd,
-            sel,
-            predecessor.as_ref(),
-            spawned,
-        )
-        .await;
+) {
+    let n = nodes.len();
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, d) in deps.iter().enumerate() {
+        for &p in d {
+            dependents[p].push(i);
+        }
+    }
+    let mut remaining: Vec<usize> = deps.iter().map(|d| d.len()).collect();
+    let roots = forksan_core::schedule::roots(&deps);
+    let barrier_mode = spawned.is_some();
 
-        let pred = outcome.map(|o| Predecessor {
-            name: sel.name.clone(),
-            reply: o.reply,
-            fork_session_id: o.fork_session_id,
-        });
-        for &child in &children[idx] {
-            // Failed predecessor: dependents still run, just without a report.
-            run_chain(
-                daemon.clone(),
-                cfg.clone(),
-                session_id.clone(),
-                project_root.clone(),
-                cwd.clone(),
-                nodes.clone(),
-                children.clone(),
-                child,
-                pred.clone(),
-                None,
+    let nodes = Arc::new(nodes);
+    let outcomes: Arc<std::sync::Mutex<Vec<Option<Predecessor>>>> =
+        Arc::new(std::sync::Mutex::new(vec![None; n]));
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let cap = if barrier_mode {
+        n.max(1)
+    } else {
+        cfg.concurrency
+    };
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(cap));
+
+    let spawn_node = |idx: usize, spawn_sig: Option<tokio::sync::oneshot::Sender<()>>| {
+        let daemon = daemon.clone();
+        let cfg = cfg.clone();
+        let sid = session.session_id.clone();
+        let proot = session.project_root.clone();
+        let cwd = session.cwd.clone();
+        let nodes = nodes.clone();
+        let deps_of = deps[idx].clone();
+        let outcomes = outcomes.clone();
+        let done_tx = done_tx.clone();
+        let semaphore = semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await;
+            // Dependencies are complete by construction; failed ones simply
+            // contribute no predecessor.
+            let preds: Vec<Predecessor> = {
+                let o = outcomes.lock().unwrap();
+                deps_of.iter().filter_map(|d| o[*d].clone()).collect()
+            };
+            let outcome = run_one_fork(
+                &daemon,
+                &cfg,
+                &sid,
+                &proot,
+                &cwd,
+                &nodes[idx],
+                &preds,
+                spawn_sig,
             )
             .await;
+            if let Some(o) = outcome {
+                outcomes.lock().unwrap()[idx] = Some(Predecessor {
+                    name: nodes[idx].name.clone(),
+                    reply: o.reply,
+                    fork_session_id: o.fork_session_id,
+                });
+            }
+            let _ = done_tx.send(idx);
+        });
+    };
+
+    let mut completed = 0usize;
+    if barrier_mode {
+        let mut waits = Vec::new();
+        for &root in &roots {
+            let (stx, srx) = tokio::sync::oneshot::channel();
+            waits.push(srx);
+            spawn_node(root, Some(stx));
         }
-    })
+        for w in waits {
+            let _ = w.await;
+        }
+        if let Some(tx) = spawned {
+            let _ = tx.send(());
+        }
+    } else {
+        // Leader alone first, then the remaining roots.
+        if let Some(&leader) = roots.first() {
+            spawn_node(leader, None);
+            if let Some(idx) = done_rx.recv().await {
+                completed += 1;
+                for &dep in &dependents[idx] {
+                    remaining[dep] -= 1;
+                    if remaining[dep] == 0 {
+                        spawn_node(dep, None);
+                    }
+                }
+            }
+        }
+        for &root in roots.iter().skip(1) {
+            spawn_node(root, None);
+        }
+    }
+
+    while completed < n {
+        let Some(idx) = done_rx.recv().await else {
+            break;
+        };
+        completed += 1;
+        for &dep in &dependents[idx] {
+            remaining[dep] -= 1;
+            if remaining[dep] == 0 {
+                spawn_node(dep, None);
+            }
+        }
+    }
 }

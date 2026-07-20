@@ -9,16 +9,16 @@ use crate::{truncate_chars, PREDECESSOR_MAX_CHARS};
 ///
 /// `trigger` is the matched `run_on` label (surfaced in the frontmatter so
 /// the fork knows why it fired). `delivery` decides what the prompt says
-/// about the fate of the final report. `predecessor` is `Some((name,
-/// report))` when this fork is sequenced `after` another fork on the parent
-/// context.
+/// about the fate of the final report. `predecessors` are the `(name,
+/// report)` pairs of the `after` dependencies that finished before this fork
+/// (empty when independent).
 pub fn build_fork_prompt(
     name: &str,
     path: &str,
     body: &str,
     trigger: &str,
     delivery: ForkDelivery,
-    predecessor: Option<(&str, &str)>,
+    predecessors: &[(String, String)],
 ) -> String {
     let fate = match delivery {
         ForkDelivery::Discard => {
@@ -33,15 +33,26 @@ pub fn build_fork_prompt(
         }
     };
 
-    let predecessor_section = match predecessor {
-        Some((dep, report)) => {
-            let report = truncate_chars(report, PREDECESSOR_MAX_CHARS);
-            format!(
-                "\n\nThis fork is sequenced after the fork '{dep}', which just finished \
-                and reported:\n\n<predecessor fork=\"{dep}\">\n{report}\n</predecessor>"
-            )
-        }
-        None => String::new(),
+    let predecessor_section = if predecessors.is_empty() {
+        String::new()
+    } else {
+        let names = predecessors
+            .iter()
+            .map(|(dep, _)| format!("'{dep}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let blocks = predecessors
+            .iter()
+            .map(|(dep, report)| {
+                let report = truncate_chars(report, PREDECESSOR_MAX_CHARS);
+                format!("<predecessor fork=\"{dep}\">\n{report}\n</predecessor>")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        format!(
+            "\n\nThis fork is sequenced after {names}, which just finished and \
+            reported:\n\n{blocks}"
+        )
     };
 
     format!(
@@ -68,7 +79,7 @@ mod tests {
             "write the journal",
             "idle:600",
             ForkDelivery::NextTurn,
-            None,
+            &[],
         );
         assert!(p.starts_with("---\nsource: forksan\nfork: journal\ntrigger: idle:600\n---\n"));
         assert!(p.contains("stored silently"));
@@ -80,23 +91,22 @@ mod tests {
 
     #[test]
     fn discard_fate() {
-        let p = build_fork_prompt("x", "/x", "b", "compact", ForkDelivery::Discard, None);
+        let p = build_fork_prompt("x", "/x", "b", "compact", ForkDelivery::Discard, &[]);
         assert!(p.contains("discarded"));
         assert!(!p.contains("stored silently"));
     }
 
     #[test]
-    fn predecessor_block_present_and_capped() {
+    fn predecessor_blocks_present_and_capped() {
         let long = "r".repeat(PREDECESSOR_MAX_CHARS + 100);
-        let p = build_fork_prompt(
-            "b",
-            "/b",
-            "body",
-            "idle",
-            ForkDelivery::NextTurn,
-            Some(("a", &long)),
-        );
+        let preds = vec![
+            ("a".to_string(), long),
+            ("z".to_string(), "z report".to_string()),
+        ];
+        let p = build_fork_prompt("b", "/b", "body", "idle", ForkDelivery::NextTurn, &preds);
+        assert!(p.contains("sequenced after 'a', 'z'"));
         assert!(p.contains("<predecessor fork=\"a\">"));
+        assert!(p.contains("<predecessor fork=\"z\">\nz report"));
         assert!(p.contains("…(truncated)"));
     }
 }

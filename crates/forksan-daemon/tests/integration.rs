@@ -20,10 +20,12 @@ INPUT=$(cat)
 N=$(date +%s%N)-$$
 mkdir -p "$STUB_DIR"
 printf '%s' "$INPUT" > "$STUB_DIR/prompt-$N.txt"
+: > "$STUB_DIR/start-$N"
 case "$INPUT" in
   *STUB_SLOW*) sleep 2 ;;
   *) sleep 0.1 ;;
 esac
+: > "$STUB_DIR/done-$N"
 case "$INPUT" in
   *STUB_FAIL*)
     printf '{"result":"boom","session_id":"stub-%s","is_error":true}\n' "$N" ;;
@@ -186,7 +188,13 @@ impl Harness {
         let mut out = Vec::new();
         if let Ok(read) = std::fs::read_dir(&self.stub_dir) {
             for entry in read.flatten() {
-                out.push(std::fs::read_to_string(entry.path()).unwrap_or_default());
+                let is_prompt = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("prompt-"));
+                if is_prompt {
+                    out.push(std::fs::read_to_string(entry.path()).unwrap_or_default());
+                }
             }
         }
         out
@@ -554,5 +562,116 @@ fn status_and_list_forks_and_shutdown() {
     }
     if let Some(mut child) = h.daemon.take() {
         let _ = child.wait();
+    }
+}
+
+#[test]
+fn same_fork_runs_never_overlap_and_extra_fires_coalesce() {
+    let mut h = Harness::new("1h");
+    // STUB_SLOW sleeps 2s; session_start fires the fork on each new-session event.
+    h.write_fork(
+        "serial.md",
+        "---\nrun_on: [session_start]\n---\nSTUB_SLOW serial work",
+    );
+    h.start_daemon();
+
+    // Three fires in quick succession (distinct sessions, same project):
+    // run 1 starts; fire 2 parks; fire 3 coalesces away.
+    for sid in ["s1", "s2", "s3"] {
+        assert_ack(h.send_event(h.event(EventKind::SessionStart, sid)));
+    }
+
+    // While runs are in flight, at most one subprocess may exist at a time.
+    let start = Instant::now();
+    let mut max_in_flight = 0usize;
+    loop {
+        let names: Vec<String> = std::fs::read_dir(&h.stub_dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let started = names.iter().filter(|n| n.starts_with("start-")).count();
+        let done = names.iter().filter(|n| n.starts_with("done-")).count();
+        max_in_flight = max_in_flight.max(started - done);
+        if started == 2 && done == 2 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "expected exactly 2 serialized runs; saw started={started} done={done}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(max_in_flight, 1, "runs of the same fork overlapped");
+    // Give a moment for any (wrong) third run to appear.
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(h.stub_prompts().len(), 2, "coalesced fire still ran");
+}
+
+#[test]
+fn overlap_true_allows_concurrent_runs() {
+    let mut h = Harness::new("1h");
+    h.write_fork(
+        "para.md",
+        "---\nrun_on: [session_start]\noverlap: true\n---\nSTUB_SLOW parallel work",
+    );
+    h.start_daemon();
+
+    for sid in ["s1", "s2", "s3"] {
+        assert_ack(h.send_event(h.event(EventKind::SessionStart, sid)));
+    }
+    let start = Instant::now();
+    loop {
+        let names: Vec<String> = std::fs::read_dir(&h.stub_dir)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let started = names.iter().filter(|n| n.starts_with("start-")).count();
+        let done = names.iter().filter(|n| n.starts_with("done-")).count();
+        if started >= 2 && done == 0 {
+            return; // two subprocesses alive at once — overlap honored
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "runs never overlapped despite overlap: true (started={started} done={done})"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn multi_dependency_gets_all_predecessor_reports() {
+    let mut h = Harness::new("1s");
+    h.write_fork("alpha.md", "---\nrun_on: [idle]\n---\nALPHA WORK");
+    h.write_fork("beta.md", "---\nrun_on: [idle]\n---\nBETA WORK");
+    h.write_fork(
+        "gamma.md",
+        "---\nrun_on: [idle]\nafter: [alpha, beta]\n---\nGAMMA WORK",
+    );
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+    assert_ack(h.send_event(h.event(EventKind::Stop, "s1")));
+
+    let start = Instant::now();
+    loop {
+        let prompts = h.stub_prompts();
+        if let Some(gamma) = prompts.iter().find(|p| p.contains("GAMMA WORK")) {
+            assert!(gamma.contains("<predecessor fork=\"alpha\">"));
+            assert!(gamma.contains("<predecessor fork=\"beta\">"));
+            // And gamma ran after both finished.
+            assert_eq!(prompts.len(), 3);
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "gamma never ran: {prompts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

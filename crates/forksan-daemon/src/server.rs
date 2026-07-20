@@ -128,7 +128,8 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                         forksan_core::frontmatter::ForkDelivery::NextTurn => "next_turn".into(),
                     },
                     throttle_secs: e.parsed.def.throttle_secs,
-                    after: e.parsed.def.after.as_ref().map(|a| a.fork.clone()),
+                    after: e.parsed.def.after.iter().map(|a| a.fork.clone()).collect(),
+                    overlap: e.parsed.def.overlap,
                     model: e.parsed.def.model.clone(),
                     warnings: e
                         .parsed
@@ -197,7 +198,7 @@ async fn run_fork_manually(
         let _ = store.queue_fork(&sid, &sel.name, &sel.path, now());
     }
     tokio::spawn(async move {
-        crate::runner::run_one_fork(&daemon_ref, &cfg, &sid, &proot, &scwd, &sel, None, None).await;
+        crate::runner::run_one_fork(&daemon_ref, &cfg, &sid, &proot, &scwd, &sel, &[], None).await;
     });
     ResponseBody::RunStarted {
         fork: name,

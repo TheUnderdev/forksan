@@ -1,9 +1,9 @@
 //! The fork definition format: a markdown file with YAML frontmatter.
 //!
 //! Top-level keys only (`description`, `run_on`, `delivery`, `throttle`,
-//! `after`, `model`); unknown keys are ignored for forward compatibility,
-//! and invalid values warn and fall back rather than dropping the fork.
-//! There is deliberately no RAG surface in this format.
+//! `after`, `overlap`, `model`); unknown keys are ignored for forward
+//! compatibility, and invalid values warn and fall back rather than dropping
+//! the fork. There is deliberately no RAG surface in this format.
 
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
@@ -21,8 +21,13 @@ pub struct ForkDef {
     pub delivery: ForkDelivery,
     /// Minimum seconds between two runs of this fork within a session.
     pub throttle_secs: Option<u64>,
-    /// Sequencing: run after another fork finishes at the same moment.
-    pub after: Option<ForkAfter>,
+    /// Sequencing: run after these forks finish at the same moment (empty =
+    /// independent).
+    pub after: Vec<ForkAfter>,
+    /// Whether two runs of this fork may overlap in time. Off by default: a
+    /// new fire waits for the previous run of the same fork to finish, and
+    /// further fires arriving while one is already waiting are dropped.
+    pub overlap: bool,
     /// Optional model override for the fork run.
     pub model: Option<String>,
 }
@@ -34,7 +39,8 @@ impl Default for ForkDef {
             run_on: default_run_on(),
             delivery: ForkDelivery::default(),
             throttle_secs: None,
-            after: None,
+            after: Vec::new(),
+            overlap: false,
             model: None,
         }
     }
@@ -58,9 +64,11 @@ pub enum ForkDelivery {
     NextTurn,
 }
 
-/// Sequencing config: run this fork after another one finishes at the same
-/// fork moment. If the referenced fork does not fire at that moment, the
-/// dependent simply runs independently.
+/// One sequencing dependency: run this fork after the referenced fork
+/// finishes at the same fork moment. Dependencies that don't fire at that
+/// moment are simply ignored. A fork may declare several (`after: [a, b]`);
+/// it runs once all of them finish, with every report piped in. At most one
+/// dependency may use `context: fork`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkAfter {
     /// The fork to wait for.
@@ -190,10 +198,14 @@ fn parse_run_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Opti
     None
 }
 
-/// Parse `after`: a plain fork-name string, or a map
+/// Parse one `after` entry: a plain fork-name string, or a map
 /// `{fork: <name>, context: parent|fork}` (`skill:` accepted as an alias for
 /// the key, for definitions shared with other tools).
-fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Option<ForkAfter> {
+fn parse_after_entry(
+    v: &serde_yaml::Value,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ForkAfter> {
     match v {
         serde_yaml::Value::String(s) if !s.trim().is_empty() => Some(ForkAfter {
             fork: s.trim().to_string(),
@@ -209,7 +221,9 @@ fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             let Some(dep) = dep else {
-                warnings.push(format!("fork '{name}': after is missing 'fork', ignoring"));
+                warnings.push(format!(
+                    "fork '{name}': after entry is missing 'fork', ignoring"
+                ));
                 return None;
             };
             let context = match get("context") {
@@ -231,6 +245,50 @@ fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
     }
 }
 
+/// Parse the full `after` value: one entry, or a list of entries. Duplicates
+/// and self-references are dropped, and at most one entry may keep
+/// `context: fork` (extras downgrade to `parent` — a fork can only resume
+/// one predecessor's session).
+fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Vec<ForkAfter> {
+    let entries: Vec<ForkAfter> = match v {
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|e| parse_after_entry(e, name, warnings))
+            .collect(),
+        other => parse_after_entry(other, name, warnings)
+            .into_iter()
+            .collect(),
+    };
+    let mut out: Vec<ForkAfter> = Vec::new();
+    let mut fork_context_seen = false;
+    for mut entry in entries {
+        if entry.fork == name {
+            warnings.push(format!("fork '{name}': after references itself, ignoring"));
+            continue;
+        }
+        if out.iter().any(|e| e.fork == entry.fork) {
+            warnings.push(format!(
+                "fork '{name}': duplicate after entry '{}', ignoring",
+                entry.fork
+            ));
+            continue;
+        }
+        if entry.context == ForkAfterContext::Fork {
+            if fork_context_seen {
+                warnings.push(format!(
+                    "fork '{name}': only one after entry may use context 'fork'; \
+                     '{}' downgraded to 'parent'",
+                    entry.fork
+                ));
+                entry.context = ForkAfterContext::Parent;
+            }
+            fork_context_seen = true;
+        }
+        out.push(entry);
+    }
+    out
+}
+
 #[derive(Deserialize, Default)]
 struct RawFork {
     #[serde(default)]
@@ -243,6 +301,8 @@ struct RawFork {
     throttle: Option<serde_yaml::Value>,
     #[serde(default)]
     after: Option<serde_yaml::Value>,
+    #[serde(default)]
+    overlap: Option<serde_yaml::Value>,
     #[serde(default)]
     model: Option<String>,
     // Recognized-and-rejected: the format has no RAG surface.
@@ -360,14 +420,22 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         }
     };
 
-    let mut after = raw
+    let after = raw
         .after
         .as_ref()
-        .and_then(|v| parse_after(v, name, &mut warnings));
-    if after.as_ref().is_some_and(|a| a.fork == name) {
-        warnings.push(format!("fork '{name}': after references itself, ignoring"));
-        after = None;
-    }
+        .map(|v| parse_after(v, name, &mut warnings))
+        .unwrap_or_default();
+
+    let overlap = match &raw.overlap {
+        None => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(_) => {
+            warnings.push(format!(
+                "fork '{name}': overlap must be true or false; using false"
+            ));
+            false
+        }
+    };
 
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
@@ -380,6 +448,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
             delivery,
             throttle_secs,
             after,
+            overlap,
             model: raw.model.filter(|m| !m.trim().is_empty()),
         },
         body: body.to_string(),
@@ -438,10 +507,10 @@ mod tests {
         assert_eq!(p.def.throttle_secs, Some(1800));
         assert_eq!(
             p.def.after,
-            Some(ForkAfter {
+            vec![ForkAfter {
                 fork: "journal".into(),
                 context: ForkAfterContext::Parent
-            })
+            }]
         );
         assert_eq!(p.def.model.as_deref(), Some("haiku"));
         assert!(p.warnings.is_empty());
@@ -522,29 +591,89 @@ mod tests {
         let p = parse("---\nafter: {fork: journal, context: fork}\n---\n");
         assert_eq!(
             p.def.after,
-            Some(ForkAfter {
+            vec![ForkAfter {
                 fork: "journal".into(),
                 context: ForkAfterContext::Fork
-            })
+            }]
         );
         // `skill:` alias for definitions shared with other tools.
         let p = parse("---\nafter: {skill: journal}\n---\n");
         assert_eq!(
             p.def.after,
-            Some(ForkAfter {
+            vec![ForkAfter {
                 fork: "journal".into(),
                 context: ForkAfterContext::Parent
-            })
+            }]
         );
         let p = parse("---\nafter: {context: fork}\n---\n");
-        assert_eq!(p.def.after, None);
+        assert!(p.def.after.is_empty());
         assert_eq!(p.warnings.len(), 1);
+    }
+
+    #[test]
+    fn after_list_forms() {
+        let p = parse("---\nafter: [a, {fork: b, context: fork}, c]\n---\n");
+        assert_eq!(
+            p.def.after,
+            vec![
+                ForkAfter {
+                    fork: "a".into(),
+                    context: ForkAfterContext::Parent
+                },
+                ForkAfter {
+                    fork: "b".into(),
+                    context: ForkAfterContext::Fork
+                },
+                ForkAfter {
+                    fork: "c".into(),
+                    context: ForkAfterContext::Parent
+                },
+            ]
+        );
+        assert!(p.warnings.is_empty());
+
+        // Duplicates dropped; second context:fork downgraded; bad entries skipped.
+        let p = parse(
+            "---\nafter:\n  - a\n  - a\n  - {fork: b, context: fork}\n  - {fork: c, context: fork}\n  - 42\n---\n",
+        );
+        assert_eq!(
+            p.def.after,
+            vec![
+                ForkAfter {
+                    fork: "a".into(),
+                    context: ForkAfterContext::Parent
+                },
+                ForkAfter {
+                    fork: "b".into(),
+                    context: ForkAfterContext::Fork
+                },
+                ForkAfter {
+                    fork: "c".into(),
+                    context: ForkAfterContext::Parent
+                },
+            ]
+        );
+        assert_eq!(p.warnings.len(), 3);
     }
 
     #[test]
     fn after_self_reference_dropped() {
         let p = parse_fork_file("me", "---\nafter: me\n---\n").unwrap();
-        assert_eq!(p.def.after, None);
+        assert!(p.def.after.is_empty());
+        assert_eq!(p.warnings.len(), 1);
+        // Also dropped from lists, keeping the rest.
+        let p = parse_fork_file("me", "---\nafter: [other, me]\n---\n").unwrap();
+        assert_eq!(p.def.after.len(), 1);
+        assert_eq!(p.def.after[0].fork, "other");
+    }
+
+    #[test]
+    fn overlap_parsing() {
+        assert!(!parse("---\ndescription: d\n---\n").def.overlap);
+        assert!(parse("---\noverlap: true\n---\n").def.overlap);
+        assert!(!parse("---\noverlap: false\n---\n").def.overlap);
+        let p = parse("---\noverlap: sometimes\n---\n");
+        assert!(!p.def.overlap);
         assert_eq!(p.warnings.len(), 1);
     }
 

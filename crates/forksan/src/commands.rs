@@ -119,8 +119,11 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if let Some(t) = f.throttle_secs {
             details.push(format!("throttle: {t}s"));
         }
-        if let Some(a) = &f.after {
-            details.push(format!("after: {a}"));
+        if !f.after.is_empty() {
+            details.push(format!("after: {}", f.after.join(", ")));
+        }
+        if f.overlap {
+            details.push("overlap allowed".into());
         }
         if let Some(m) = &f.model {
             details.push(format!("model: {m}"));

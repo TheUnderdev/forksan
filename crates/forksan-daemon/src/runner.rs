@@ -32,8 +32,8 @@ impl forksan_core::schedule::Selected for SelectedFork {
     fn name(&self) -> &str {
         &self.name
     }
-    fn after(&self) -> Option<&str> {
-        self.def.after.as_ref().map(|a| a.fork.as_str())
+    fn after(&self) -> Vec<&str> {
+        self.def.after.iter().map(|a| a.fork.as_str()).collect()
     }
 }
 
@@ -88,6 +88,11 @@ fn parse_claude_output(stdout: &str) -> Option<ClaudeResult> {
 /// (signalling `spawned` as soon as the child exists), enforces the timeout,
 /// and returns the outcome for `after` sequencing. Failures produce a
 /// failure report (unless delivery is `discard`) and return `None`.
+///
+/// Unless the fork opted into `overlap`, the run first takes the fork's
+/// per-project gate: it waits for a running instance of the same fork to
+/// finish, and skips entirely (returning `None`) when another fire is
+/// already parked waiting.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_one_fork(
     daemon: &Arc<Daemon>,
@@ -96,9 +101,27 @@ pub async fn run_one_fork(
     project_root: &Path,
     cwd: &Path,
     sel: &SelectedFork,
-    predecessor: Option<&Predecessor>,
+    predecessors: &[Predecessor],
     spawned: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Option<RunOutcome> {
+    let mut spawned = spawned;
+    let _gate = if sel.def.overlap {
+        None
+    } else {
+        match daemon.run_gates.acquire(project_root, &sel.name).await {
+            Some(guard) => Some(guard),
+            None => {
+                // Another fire of this fork is already waiting; it will run
+                // against fresh state, so this one adds nothing.
+                tracing::info!(fork = %sel.name, "fire coalesced into the already-waiting one");
+                if let Some(tx) = spawned.take() {
+                    let _ = tx.send(());
+                }
+                return None;
+            }
+        }
+    };
+
     let now = crate::daemon::now();
     let deliver = sel.def.delivery != ForkDelivery::Discard;
 
@@ -123,15 +146,24 @@ pub async fn run_one_fork(
         run_id
     };
 
-    // `context: fork` sequencing: resume the predecessor fork's session when
-    // available, else fall back to the parent.
-    let resume_target = match (predecessor, sel.def.after.as_ref()) {
-        (Some(p), Some(a)) if a.context == forksan_core::frontmatter::ForkAfterContext::Fork => p
-            .fork_session_id
-            .clone()
-            .unwrap_or_else(|| session_id.to_string()),
-        _ => session_id.to_string(),
-    };
+    // `context: fork` sequencing: resume that predecessor fork's session
+    // when available, else fall back to the parent. Its report is not piped
+    // (the dependent sees its whole context); every other predecessor's
+    // report is.
+    let fork_ctx_dep = sel
+        .def
+        .after
+        .iter()
+        .find(|a| a.context == forksan_core::frontmatter::ForkAfterContext::Fork);
+    let resume_target = fork_ctx_dep
+        .and_then(|a| predecessors.iter().find(|p| p.name == a.fork))
+        .and_then(|p| p.fork_session_id.clone())
+        .unwrap_or_else(|| session_id.to_string());
+    let piped: Vec<(String, String)> = predecessors
+        .iter()
+        .filter(|p| fork_ctx_dep.is_none_or(|a| a.fork != p.name))
+        .map(|p| (p.name.clone(), p.reply.clone()))
+        .collect();
 
     let prompt = build_fork_prompt(
         &sel.name,
@@ -139,7 +171,7 @@ pub async fn run_one_fork(
         &sel.body,
         &sel.trigger,
         sel.def.delivery,
-        predecessor.map(|p| (p.name.as_str(), p.reply.as_str())),
+        &piped,
     );
 
     let mut cmd = tokio::process::Command::new(&cfg.claude_bin);

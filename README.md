@@ -65,7 +65,8 @@ open questions, and next steps. Keep it under 200 lines.
 | `run_on` | list of moments, see below | `[idle, compact]` |
 | `delivery` | `next_turn` \| `discard` | `next_turn` |
 | `throttle` | min gap between runs: `30m`, `2h`, `90` (seconds) | none |
-| `after` | fork name, or `{fork: name, context: parent\|fork}` | — |
+| `after` | fork name(s): `journal`, `[a, b]`, or maps `{fork: name, context: parent\|fork}` | — |
+| `overlap` | `true` to allow two runs of this fork at once | `false` |
 | `model` | model override for the fork run | session default |
 
 Moments for `run_on`:
@@ -87,9 +88,15 @@ the warnings). Fork bodies should be **idempotent** — a fork may fire at every
 context on the next prompt (or into the next session in the same project, if the original is
 gone). `discard` runs the fork for its tool side effects only.
 
-`after` sequencing: the dependent fork runs after its predecessor finishes, with the
-predecessor's report quoted in its prompt. `context: fork` goes further — the dependent forks
-the predecessor fork's *own session*, seeing everything it saw and did.
+`after` sequencing: the dependent fork runs once **all** its listed predecessors finish, with
+every report quoted in its prompt (`after: [research, lint]`). `context: fork` goes further —
+the dependent forks that predecessor fork's *own session*, seeing everything it saw and did;
+at most one dependency may use it.
+
+Runs of the same fork never overlap by default: if a moment fires while a previous run of that
+fork is still going (say a 4-minute idle fork that takes ten minutes), the new fire waits for
+it to finish, and any further fires arriving in the meantime are dropped — one is already
+queued, and fork bodies are idempotent. Set `overlap: true` to allow concurrent runs.
 
 ## How it works
 

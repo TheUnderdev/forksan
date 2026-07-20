@@ -25,6 +25,8 @@ pub struct Daemon {
     pub paths: Paths,
     pub store: Mutex<Store>,
     pub sessions: Mutex<HashMap<String, SessionRuntime>>,
+    /// Per-(project, fork) serialization gates (`overlap: false`).
+    pub run_gates: crate::gates::RunGates,
     pub active_runs: AtomicUsize,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
@@ -38,6 +40,7 @@ impl Daemon {
             paths,
             store: Mutex::new(store),
             sessions: Mutex::new(HashMap::new()),
+            run_gates: crate::gates::RunGates::default(),
             active_runs: AtomicUsize::new(0),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),

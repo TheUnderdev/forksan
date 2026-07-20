@@ -1,4 +1,5 @@
 mod daemon;
+mod gates;
 mod idle;
 mod planner;
 mod runner;

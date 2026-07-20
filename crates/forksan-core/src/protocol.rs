@@ -185,7 +185,10 @@ pub struct ForkInfo {
     pub triggers: Vec<String>,
     pub delivery: String,
     pub throttle_secs: Option<u64>,
-    pub after: Option<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub overlap: bool,
     pub model: Option<String>,
     pub warnings: Vec<String>,
 }
