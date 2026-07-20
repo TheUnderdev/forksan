@@ -18,6 +18,36 @@ const FORK_DEFAULT_VERSION: [u64; 3] = [2, 1, 161];
 /// `CLAUDE_CODE_FORK_SUBAGENT=1` until [`FORK_DEFAULT_VERSION`]).
 const FORK_GATED_VERSION: [u64; 3] = [2, 1, 117];
 
+/// The doctor hint printed for a fork-capable version: whether the explicit
+/// enable env is set, plus how to pin it against Claude Code's dynamic agent
+/// disclosure (a wake reporting "'fork' not found" on a current version is
+/// disclosure-gating, not a version problem).
+fn fork_disclosure_hint() -> Vec<String> {
+    fork_disclosure_hint_lines(std::env::var_os("CLAUDE_CODE_FORK_SUBAGENT").is_some())
+}
+
+fn fork_disclosure_hint_lines(env_set: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(if env_set {
+        "        CLAUDE_CODE_FORK_SUBAGENT is set (explicit fork-subagent enable)".to_string()
+    } else {
+        "        note: CLAUDE_CODE_FORK_SUBAGENT is not set".to_string()
+    });
+    lines.push(
+        "        if a wake reports \"Agent type 'fork' not found\" on this version, Claude Code is"
+            .to_string(),
+    );
+    lines.push(
+        "        disclosing agent types dynamically — pin the fork type by adding".to_string(),
+    );
+    lines.push(
+        "        {\"env\": {\"CLAUDE_CODE_FORK_SUBAGENT\": \"1\"}} to ~/.claude/settings.json"
+            .to_string(),
+    );
+    lines.push("        (best-effort — the disclosure interaction is undocumented)".to_string());
+    lines
+}
+
 /// Extract the first `x.y.z` triple from `claude --version` output (which may
 /// be just the number or include trailing text). `None` if none is found.
 fn parse_version(s: &str) -> Option<[u64; 3]> {
@@ -297,7 +327,12 @@ pub fn doctor(paths: &Paths) -> Result<(), String> {
             let raw = String::from_utf8_lossy(&out.stdout);
             let raw = raw.trim();
             match parse_version(raw) {
-                Some(v) if v >= FORK_DEFAULT_VERSION => ok(&format!("claude: {raw}")),
+                Some(v) if v >= FORK_DEFAULT_VERSION => {
+                    ok(&format!("claude: {raw}"));
+                    for line in fork_disclosure_hint() {
+                        println!("{line}");
+                    }
+                }
                 Some(v) if v >= FORK_GATED_VERSION => {
                     println!("  WARN: claude {raw}: the fork subagent is gated on this version —");
                     println!("        export CLAUDE_CODE_FORK_SUBAGENT=1 or upgrade to >= 2.1.161");
@@ -347,5 +382,19 @@ mod tests {
         assert!(gated < FORK_DEFAULT_VERSION && gated >= FORK_GATED_VERSION);
         assert!(parse_version("2.1.116").unwrap() < FORK_GATED_VERSION);
         assert!(parse_version("2.0.999").unwrap() < FORK_GATED_VERSION);
+    }
+
+    #[test]
+    fn fork_disclosure_hint_reflects_env_and_recommends_pin() {
+        let set = fork_disclosure_hint_lines(true).join("\n");
+        assert!(set.contains("CLAUDE_CODE_FORK_SUBAGENT is set"));
+        assert!(set.contains("~/.claude/settings.json"));
+        assert!(set.contains("best-effort"));
+
+        let unset = fork_disclosure_hint_lines(false).join("\n");
+        assert!(unset.contains("CLAUDE_CODE_FORK_SUBAGENT is not set"));
+        assert!(unset.contains("Agent type 'fork' not found"));
+        assert!(unset.contains("disclosing agent types dynamically"));
+        assert!(unset.contains(r#"{"env": {"CLAUDE_CODE_FORK_SUBAGENT": "1"}}"#));
     }
 }

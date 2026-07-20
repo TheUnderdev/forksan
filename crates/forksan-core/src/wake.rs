@@ -121,14 +121,21 @@ pub fn build_wake_payload(session_id: &str, project_root: &str, forks: &[DueFork
     format!("{}\n\n{closer}{CONTINGENCY}", blocks.join("\n\n"))
 }
 
-/// Rides in every wake so an older Claude Code without the `fork` subagent type
-/// degrades to a visible one-liner instead of retrying or substituting a
-/// (context-less) agent that can't do a fork's job.
-const CONTINGENCY: &str = " If the Agent tool reports that the 'fork' agent type is not \
-    available, do NOT retry and do NOT substitute another agent type (other agents don't \
-    inherit this conversation and cannot do a fork's job). Instead reply with one line: \
-    forksan requires a Claude Code version with the fork subagent type — forks are disabled \
-    in this session. Then stop.";
+/// Rides in every wake to recover from Claude Code's dynamic agent disclosure:
+/// on current builds the `fork` type may not be in the Agent tool's disclosed
+/// roster for a hook-injected turn (disclosure keys off the user's own prompt),
+/// so the first call can fail with "Agent type 'fork' not found". Retrying once
+/// in the same turn is cheap; if it still fails, the spawn instructions above
+/// persist in context and the user's next real message discloses the type, so
+/// we defer rather than substitute a (context-less) agent that can't do a
+/// fork's job.
+const CONTINGENCY: &str = " If the Agent tool reports \"Agent type 'fork' not found\" (or that \
+    the 'fork' agent type is unavailable), first retry the exact same Agent call once. If it \
+    still fails, do NOT substitute another agent type (other agents don't inherit this \
+    conversation and cannot do a fork's job) — instead reply with one line telling the user \
+    the fork agent type isn't loaded in this turn (Claude Code discloses it dynamically) and \
+    that sending any next message will let the forks spawn. When the user next messages, spawn \
+    the due forks listed above before doing anything else.";
 
 #[cfg(test)]
 mod tests {
@@ -186,9 +193,13 @@ mod tests {
         // overlap:false → skip-if-running line present.
         assert!(p.contains("skip spawning it"));
         assert!(p.contains("After spawning the fork above"));
-        // Contingency for installs without the fork subagent type.
-        assert!(p.contains("'fork' agent type is not available"));
-        assert!(p.contains("forks are disabled in this session"));
+        // Contingency v2: retry once, then defer to the next user message.
+        assert!(p.contains("Agent type 'fork' not found"));
+        assert!(p.contains("retry the exact same Agent call once"));
+        assert!(p.contains("sending any next message will let the forks spawn"));
+        assert!(p.contains("spawn the due forks listed above before doing anything else"));
+        // Never substitute another agent type.
+        assert!(p.contains("do NOT substitute another agent type"));
     }
 
     #[test]

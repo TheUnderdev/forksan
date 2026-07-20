@@ -42,10 +42,28 @@ interactive sessions:
 - **2.1.117 – 2.1.160** — it exists but is gated; export `CLAUDE_CODE_FORK_SUBAGENT=1`.
 - **< 2.1.117** — no fork subagent; forksan v0.5 can't run forks.
 
-`forksan doctor` checks your `claude --version` against these thresholds. On a version without fork
-support a wake safely no-ops: the model replies with a visible one-liner ("forksan requires a Claude
-Code version with the fork subagent type — forks are disabled in this session") instead of running
-forks.
+`forksan doctor` checks your `claude --version` against these thresholds.
+
+### Dynamic agent disclosure
+
+Even on a current version a wake can report **`Agent type 'fork' not found`**. Newer Claude Code
+builds disclose agent types *dynamically* — the Agent tool's roster is derived from the user's own
+prompt (RAG-style, matched against agent descriptions), and forksan's hook-injected wake reminder
+doesn't reliably trigger that disclosure. When it happens the wake safely recovers instead of
+substituting a wrong agent: the model retries the fork call once, and if the `fork` type still isn't
+disclosed it tells you the type isn't loaded this turn and that **any next message will let the forks
+spawn** — your next organic prompt discloses `fork`, and the pending spawn instructions (still in
+context) then succeed.
+
+To reduce this on a machine where wakes keep reporting the type unavailable despite a current
+version, add an explicit enable to `~/.claude/settings.json`:
+
+```json
+{ "env": { "CLAUDE_CODE_FORK_SUBAGENT": "1" } }
+```
+
+This is **best-effort** — it pins the flag against staged rollout, but the disclosure interaction
+itself is undocumented, so the say-anything recovery above remains the reliable fallback.
 
 ## Install
 
