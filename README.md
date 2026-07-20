@@ -93,13 +93,12 @@ every report quoted in its prompt (`after: [research, lint]`). `context: fork` g
 the dependent forks that predecessor fork's *own session*, seeing everything it saw and did;
 at most one dependency may use it.
 
-Runs of the same fork never overlap by default: if a moment fires while a previous run of that
-fork is still going (say a 4-minute idle fork that takes ten minutes), the new fire waits for
-it to finish, and any further fires arriving in the meantime are dropped — one is already
-queued, and fork bodies are idempotent. The waiting run also gets continuity: when the
-previous run's report hasn't reached the parent conversation yet, it is quoted into the new
-run's prompt as a `<previous_run>` block, so consecutive runs build on each other instead of
-repeating work. Set `overlap: true` to allow concurrent runs (no continuity block).
+Runs of the same fork never overlap by default: if a moment fires while a previous run of
+that fork is still going (say a 4-minute idle fork whose run takes ten minutes), that fire is
+simply cancelled. The fork fires again at its next moment — the next idle timeout only comes
+around after you've prompted again, which is exactly when the previous run's report gets
+injected into your session — so the next run inherits a parent context that already contains
+the previous result. Set `overlap: true` to allow concurrent runs.
 
 ## How it works
 

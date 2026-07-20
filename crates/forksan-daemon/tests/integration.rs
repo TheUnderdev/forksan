@@ -566,7 +566,7 @@ fn status_and_list_forks_and_shutdown() {
 }
 
 #[test]
-fn same_fork_runs_never_overlap_and_extra_fires_coalesce() {
+fn in_flight_fork_skips_new_fires_until_next_moment() {
     let mut h = Harness::new("1h");
     // STUB_SLOW sleeps 2s; session_start fires the fork on each new-session event.
     h.write_fork(
@@ -575,15 +575,12 @@ fn same_fork_runs_never_overlap_and_extra_fires_coalesce() {
     );
     h.start_daemon();
 
-    // Three fires in quick succession (distinct sessions, same project):
-    // run 1 starts; fire 2 parks; fire 3 coalesces away.
+    // Three fires in quick succession: run 1 starts; fires 2 and 3 are
+    // cancelled outright (a run is in flight).
     for sid in ["s1", "s2", "s3"] {
         assert_ack(h.send_event(h.event(EventKind::SessionStart, sid)));
     }
-
-    // While runs are in flight, at most one subprocess may exist at a time.
     let start = Instant::now();
-    let mut max_in_flight = 0usize;
     loop {
         let names: Vec<String> = std::fs::read_dir(&h.stub_dir)
             .map(|d| {
@@ -592,36 +589,39 @@ fn same_fork_runs_never_overlap_and_extra_fires_coalesce() {
                     .collect()
             })
             .unwrap_or_default();
-        let started = names.iter().filter(|n| n.starts_with("start-")).count();
         let done = names.iter().filter(|n| n.starts_with("done-")).count();
-        max_in_flight = max_in_flight.max(started - done);
-        if started == 2 && done == 2 {
+        if done == 1 {
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(20),
-            "expected exactly 2 serialized runs; saw started={started} done={done}"
+            start.elapsed() < Duration::from_secs(15),
+            "first run never finished: {names:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(max_in_flight, 1, "runs of the same fork overlapped");
-    // Give a moment for any (wrong) third run to appear.
-    std::thread::sleep(Duration::from_millis(700));
-    let prompts = h.stub_prompts();
-    assert_eq!(prompts.len(), 2, "coalesced fire still ran");
-
-    // Gated continuity: the waiting run's prompt carries the first run's
-    // report (it was never delivered to the parent in between).
-    let with_previous: Vec<&String> = prompts
-        .iter()
-        .filter(|p| p.contains("<previous_run fork=\"serial\">"))
-        .collect();
+    // Give any (wrong) parked run a moment to appear.
+    std::thread::sleep(Duration::from_millis(800));
     assert_eq!(
-        with_previous.len(),
+        h.stub_prompts().len(),
         1,
-        "exactly the second run sees the first's report"
+        "in-flight fires were not cancelled"
     );
-    assert!(with_previous[0].contains("stub report"));
+
+    // The next occurrence of the moment fires normally again.
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s4")));
+    let start = Instant::now();
+    while h.stub_prompts().len() < 2 {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "fork did not fire at its next moment"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // No continuity block: the next run inherits the parent context as-is.
+    assert!(h
+        .stub_prompts()
+        .iter()
+        .all(|p| !p.contains("<previous_run")));
 }
 
 #[test]

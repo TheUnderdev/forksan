@@ -89,10 +89,10 @@ fn parse_claude_output(stdout: &str) -> Option<ClaudeResult> {
 /// and returns the outcome for `after` sequencing. Failures produce a
 /// failure report (unless delivery is `discard`) and return `None`.
 ///
-/// Unless the fork opted into `overlap`, the run first takes the fork's
-/// per-project gate: it waits for a running instance of the same fork to
-/// finish, and skips entirely (returning `None`) when another fire is
-/// already parked waiting.
+/// Unless the fork opted into `overlap`, the fire is skipped entirely
+/// (returning `None`) when a run of the same fork is still in flight for
+/// this project — the fork fires again at its next moment, whose context
+/// will include this run's delivered report.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_one_fork(
     daemon: &Arc<Daemon>,
@@ -108,12 +108,12 @@ pub async fn run_one_fork(
     let _gate = if sel.def.overlap {
         None
     } else {
-        match daemon.run_gates.acquire(project_root, &sel.name).await {
-            Some(guard) => Some(guard),
+        match daemon.run_gates.try_start(project_root, &sel.name) {
+            Some(token) => Some(token),
             None => {
-                // Another fire of this fork is already waiting; it will run
-                // against fresh state, so this one adds nothing.
-                tracing::info!(fork = %sel.name, "fire coalesced into the already-waiting one");
+                // A run of this fork is still in flight: cancel this fire;
+                // the next moment's fire will see its delivered report.
+                tracing::info!(fork = %sel.name, "previous run still in flight, skipping this fire");
                 if let Some(tx) = spawned.take() {
                     let _ = tx.send(());
                 }
@@ -165,18 +165,6 @@ pub async fn run_one_fork(
         .map(|p| (p.name.clone(), p.reply.clone()))
         .collect();
 
-    // Gated continuity: surface the last run's report when the parent
-    // conversation we're forking hasn't received it yet.
-    let previous_report = if sel.def.overlap {
-        None
-    } else {
-        let store = daemon.store.lock().unwrap();
-        store
-            .latest_unseen_response(project_root, &sel.name, session_id)
-            .ok()
-            .flatten()
-    };
-
     let prompt = build_fork_prompt(
         &sel.name,
         &sel.path.to_string_lossy(),
@@ -184,7 +172,6 @@ pub async fn run_one_fork(
         &sel.trigger,
         sel.def.delivery,
         &piped,
-        previous_report.as_deref(),
     );
 
     let mut cmd = tokio::process::Command::new(&cfg.claude_bin);

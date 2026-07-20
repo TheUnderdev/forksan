@@ -575,29 +575,6 @@ impl Store {
         Ok(items)
     }
 
-    /// The newest `response` report of `fork_name` in this project that has
-    /// NOT reached `session_id`'s conversation: undelivered, or delivered to
-    /// a different session. Used by gated (`overlap: false`) runs so the
-    /// next instance sees the previous one's result even when the parent
-    /// hasn't picked it up yet.
-    pub fn latest_unseen_response(
-        &self,
-        project_root: &Path,
-        fork_name: &str,
-        session_id: &str,
-    ) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT body FROM reports
-                 WHERE project_root = ?1 AND fork_name = ?2 AND kind = 'response'
-                   AND (delivered_at IS NULL OR delivered_to_session != ?3)
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-                params![project_root.to_string_lossy(), fork_name, session_id],
-                |row| row.get(0),
-            )
-            .optional()
-    }
-
     pub fn count_pending_reports(&self) -> rusqlite::Result<u64> {
         self.conn.query_row(
             "SELECT COUNT(*) FROM reports WHERE delivered_at IS NULL",
@@ -917,75 +894,6 @@ mod tests {
                 .unwrap()
                 .session_id,
             "a"
-        );
-    }
-
-    #[test]
-    fn latest_unseen_response_for_gated_runs() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        // Nothing yet.
-        assert_eq!(
-            s.latest_unseen_response(Path::new("/p"), "f", "a").unwrap(),
-            None
-        );
-
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            "first",
-            110,
-        )
-        .unwrap();
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            "second",
-            120,
-        )
-        .unwrap();
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "g",
-            "idle",
-            ReportKind::Response,
-            "other fork",
-            130,
-        )
-        .unwrap();
-        // Undelivered → newest of the same fork is visible.
-        assert_eq!(
-            s.latest_unseen_response(Path::new("/p"), "f", "a")
-                .unwrap()
-                .as_deref(),
-            Some("second")
-        );
-
-        // Delivered to this session → already in its conversation, not unseen.
-        let _ = s
-            .poll_reports("a", Path::new("/p"), usize::MAX, 200)
-            .unwrap();
-        assert_eq!(
-            s.latest_unseen_response(Path::new("/p"), "f", "a").unwrap(),
-            None
-        );
-        // …but still unseen from a sibling session's perspective.
-        seed_session(&s, "b", "/p", 100);
-        assert_eq!(
-            s.latest_unseen_response(Path::new("/p"), "f", "b")
-                .unwrap()
-                .as_deref(),
-            Some("second")
         );
     }
 }

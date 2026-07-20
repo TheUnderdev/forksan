@@ -1,85 +1,77 @@
-//! Per-fork run gates: by default two runs of the same fork never overlap.
+//! Per-fork in-flight tracking: by default (`overlap: false`) a fork moment
+//! firing while a previous run of the same fork is still going is simply
+//! skipped — the fork fires again at its next moment, by which time the
+//! previous run's report has reached the parent conversation (reports are
+//! delivered at the parent's next prompt, and e.g. an idle deadline only
+//! re-fires after such activity), so the fresh fork context contains it
+//! natively.
 //!
 //! Keyed by (project root, fork name) — a session resume changes the session
 //! id mid-conversation, and two sessions in one project touch the same
 //! files, so the project is the right serialization boundary.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
-struct Gate {
-    lock: Arc<tokio::sync::Mutex<()>>,
-    /// Whether a fire is already parked waiting on `lock`.
-    waiting: AtomicBool,
+pub struct RunGates {
+    running: Arc<Mutex<HashSet<(PathBuf, String)>>>,
 }
 
-#[derive(Default)]
-pub struct RunGates {
-    gates: Mutex<HashMap<(PathBuf, String), Arc<Gate>>>,
+/// Marks a fork run as in flight for its lifetime; dropping it releases.
+pub struct RunToken {
+    running: Arc<Mutex<HashSet<(PathBuf, String)>>>,
+    key: (PathBuf, String),
+}
+
+impl Drop for RunToken {
+    fn drop(&mut self) {
+        self.running.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl RunGates {
-    /// Serialize a run of `fork` within `project`: waits for any running
-    /// instance to finish, then returns the held guard. Returns `None` when
-    /// another fire is already waiting — the caller should skip entirely
-    /// (fork bodies are idempotent; the parked fire will run against fresh
-    /// state, so stacking a third run adds nothing).
-    pub async fn acquire(
-        &self,
-        project: &Path,
-        fork: &str,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        let gate = {
-            let mut gates = self.gates.lock().unwrap();
-            gates
-                .entry((project.to_path_buf(), fork.to_string()))
-                .or_insert_with(|| Arc::new(Gate::default()))
-                .clone()
-        };
-        if gate.waiting.swap(true, Ordering::SeqCst) {
+    /// Claim (project, fork) as running. `None` when a run is already in
+    /// flight — the caller should skip this fire entirely.
+    pub fn try_start(&self, project: &Path, fork: &str) -> Option<RunToken> {
+        let key = (project.to_path_buf(), fork.to_string());
+        let mut running = self.running.lock().unwrap();
+        if !running.insert(key.clone()) {
             return None;
         }
-        let guard = gate.lock.clone().lock_owned().await;
-        gate.waiting.store(false, Ordering::SeqCst);
-        Some(guard)
+        Some(RunToken {
+            running: self.running.clone(),
+            key,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    #[tokio::test]
-    async fn serializes_and_coalesces() {
-        let gates = Arc::new(RunGates::default());
+    #[test]
+    fn skips_while_in_flight_and_releases_on_drop() {
+        let gates = RunGates::default();
         let project = Path::new("/p");
 
-        // First fire runs immediately.
-        let g1 = gates.acquire(project, "f").await.expect("first fire runs");
-
-        // Second fire parks; third coalesces away while second waits.
-        let gates2 = gates.clone();
-        let waiter =
-            tokio::spawn(async move { gates2.acquire(Path::new("/p"), "f").await.is_some() });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "second fire must wait");
+        let t1 = gates.try_start(project, "f").expect("first fire runs");
         assert!(
-            gates.acquire(project, "f").await.is_none(),
-            "third fire coalesces"
+            gates.try_start(project, "f").is_none(),
+            "second fire skipped"
+        );
+        assert!(
+            gates.try_start(project, "f").is_none(),
+            "third fire skipped"
         );
 
         // Different fork / different project are independent.
-        assert!(gates.acquire(project, "other").await.is_some());
-        assert!(gates.acquire(Path::new("/q"), "f").await.is_some());
+        assert!(gates.try_start(project, "other").is_some());
+        assert!(gates.try_start(Path::new("/q"), "f").is_some());
 
-        // Releasing lets the parked fire through, and the gate resets.
-        drop(g1);
-        assert!(waiter.await.unwrap(), "waiter runs after release");
-        // (waiter's guard dropped with its task) — a fresh fire runs.
-        assert!(gates.acquire(project, "f").await.is_some());
+        // Finishing releases: the next moment's fire runs again.
+        drop(t1);
+        assert!(gates.try_start(project, "f").is_some());
     }
 }

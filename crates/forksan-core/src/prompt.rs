@@ -11,9 +11,7 @@ use crate::{truncate_chars, PREDECESSOR_MAX_CHARS};
 /// the fork knows why it fired). `delivery` decides what the prompt says
 /// about the fate of the final report. `predecessors` are the `(name,
 /// report)` pairs of the `after` dependencies that finished before this fork
-/// (empty when independent). `previous_report` is the report of the last
-/// run of this same fork when it is not yet part of the forked context
-/// (gated `overlap: false` continuity).
+/// (empty when independent).
 pub fn build_fork_prompt(
     name: &str,
     path: &str,
@@ -21,7 +19,6 @@ pub fn build_fork_prompt(
     trigger: &str,
     delivery: ForkDelivery,
     predecessors: &[(String, String)],
-    previous_report: Option<&str>,
 ) -> String {
     let fate = match delivery {
         ForkDelivery::Discard => {
@@ -58,19 +55,6 @@ pub fn build_fork_prompt(
         )
     };
 
-    let previous_section = match previous_report {
-        Some(report) => {
-            let report = truncate_chars(report, PREDECESSOR_MAX_CHARS);
-            format!(
-                "\n\nA previous run of this fork already reported the following, and its \
-                report has not reached the parent conversation above yet — take it into \
-                account and build on it instead of repeating the work:\n\n\
-                <previous_run fork=\"{name}\">\n{report}\n</previous_run>"
-            )
-        }
-        None => String::new(),
-    };
-
     format!(
         "---\nsource: forksan\nfork: {name}\ntrigger: {trigger}\n---\n\
         **Fork: {name}** (trigger: {trigger}). You are running in a throwaway fork of \
@@ -78,7 +62,7 @@ pub fn build_fork_prompt(
         reaches the user. This fork exists only to execute the instructions below, which \
         were silently triggered during the session. {fate} Do not try to message the \
         user. The fork may have run earlier in this same session; treat its instructions \
-        idempotently.{previous_section}{predecessor_section}\n\n\
+        idempotently.{predecessor_section}\n\n\
         <fork name=\"{name}\" source=\"{path}\">\n{body}\n</fork>"
     )
 }
@@ -96,7 +80,6 @@ mod tests {
             "idle:600",
             ForkDelivery::NextTurn,
             &[],
-            None,
         );
         assert!(p.starts_with("---\nsource: forksan\nfork: journal\ntrigger: idle:600\n---\n"));
         assert!(p.contains("stored silently"));
@@ -108,7 +91,7 @@ mod tests {
 
     #[test]
     fn discard_fate() {
-        let p = build_fork_prompt("x", "/x", "b", "compact", ForkDelivery::Discard, &[], None);
+        let p = build_fork_prompt("x", "/x", "b", "compact", ForkDelivery::Discard, &[]);
         assert!(p.contains("discarded"));
         assert!(!p.contains("stored silently"));
     }
@@ -120,33 +103,10 @@ mod tests {
             ("a".to_string(), long),
             ("z".to_string(), "z report".to_string()),
         ];
-        let p = build_fork_prompt(
-            "b",
-            "/b",
-            "body",
-            "idle",
-            ForkDelivery::NextTurn,
-            &preds,
-            None,
-        );
+        let p = build_fork_prompt("b", "/b", "body", "idle", ForkDelivery::NextTurn, &preds);
         assert!(p.contains("sequenced after 'a', 'z'"));
         assert!(p.contains("<predecessor fork=\"a\">"));
         assert!(p.contains("<predecessor fork=\"z\">\nz report"));
         assert!(p.contains("…(truncated)"));
-    }
-
-    #[test]
-    fn previous_run_block() {
-        let p = build_fork_prompt(
-            "j",
-            "/j",
-            "body",
-            "idle",
-            ForkDelivery::NextTurn,
-            &[],
-            Some("earlier findings"),
-        );
-        assert!(p.contains("<previous_run fork=\"j\">\nearlier findings\n</previous_run>"));
-        assert!(p.contains("build on it"));
     }
 }
