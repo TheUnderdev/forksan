@@ -1,10 +1,18 @@
 //! The fork definition format: a markdown file with YAML frontmatter.
 //!
-//! Top-level keys only (`description`, `run_on`, `delivery`, `throttle`,
-//! `after`, `overlap`, `model`, `tags`, `allowed_tools`, `permission_mode`);
-//! unknown keys are ignored for forward compatibility, and invalid values
-//! warn and fall back rather than dropping the fork. There is deliberately no
-//! RAG surface in this format.
+//! Since v0.5 a fork MUST carry an explicit `fork: true` marker in its
+//! frontmatter. `.forksan/forks/` may hold arbitrary companion `.md` files
+//! (reference notes a fork body reads, etc.); only files marked `fork: true`
+//! are forks. Files without the marker are skipped — silently for plain
+//! notes, with a migration warning when they carry fork-like frontmatter.
+//!
+//! Supported top-level keys: `fork`, `description`, `run_on`, `throttle`,
+//! `after`, `overlap`, `tags`. Unknown keys are ignored for forward
+//! compatibility; invalid values warn and fall back rather than dropping the
+//! fork. The keys `delivery`, `model`, `allowed_tools`, `permission_mode` are
+//! parsed-and-ignored with a deprecation warning (v0.5 forks inherit the
+//! session's permissions and model; report delivery is native). There is
+//! deliberately no RAG surface in this format.
 
 use crate::duration::parse_duration_yaml;
 use serde::Deserialize;
@@ -17,30 +25,16 @@ pub struct ForkDef {
     pub description: Option<String>,
     /// The fork moments this fork fires at.
     pub run_on: Vec<ForkRunOn>,
-    /// Where the fork's boundary events (start marker + final report) land
-    /// in the parent session.
-    pub delivery: ForkDelivery,
     /// Minimum seconds between two runs of this fork within a session.
     pub throttle_secs: Option<u64>,
     /// Sequencing: run after these forks finish at the same moment (empty =
     /// independent).
-    pub after: Vec<ForkAfter>,
-    /// Whether two runs of this fork may overlap in time. Off by default: a
-    /// new fire waits for the previous run of the same fork to finish, and
-    /// further fires arriving while one is already waiting are dropped.
+    pub after: Vec<String>,
+    /// Whether two runs of this fork may overlap in time. Off by default.
     pub overlap: bool,
-    /// Optional model override for the fork run.
-    pub model: Option<String>,
     /// Free-form tags used by the per-session enable/disable filter. Empty
     /// when unset.
     pub tags: Vec<String>,
-    /// Permission rules granted to the fork subprocess, each passed verbatim
-    /// to `--allowedTools` (e.g. `Write`, `Bash(git add:*)`). Empty when unset
-    /// — a headless fork can then only use read-only tools.
-    pub allowed_tools: Vec<String>,
-    /// Optional `--permission-mode` for the fork subprocess (`default`,
-    /// `acceptEdits`, or `bypassPermissions`). `None` = no flag.
-    pub permission_mode: Option<String>,
 }
 
 impl Default for ForkDef {
@@ -48,107 +42,80 @@ impl Default for ForkDef {
         Self {
             description: None,
             run_on: default_run_on(),
-            delivery: ForkDelivery::default(),
             throttle_secs: None,
             after: Vec::new(),
             overlap: false,
-            model: None,
             tags: Vec::new(),
-            allowed_tools: Vec::new(),
-            permission_mode: None,
         }
     }
 }
 
-/// The default fork moments: every idle pause (at the default idle deadline)
-/// and context compaction.
+/// The default fork moment when `run_on` is absent: every idle pause at the
+/// default idle deadline. (Before v0.5 this also included `compact`, which no
+/// longer exists.)
 pub fn default_run_on() -> Vec<ForkRunOn> {
-    vec![ForkRunOn::Idle { after_secs: None }, ForkRunOn::Compact]
-}
-
-/// Where a fork's boundary events land in the parent session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ForkDelivery {
-    /// No boundary events: the report is thrown away; the fork runs for its
-    /// tool side effects only.
-    Discard,
-    /// Both events are queued and injected as context on the parent's next
-    /// turn (or the next session in the same project if the parent is gone).
-    #[default]
-    NextTurn,
-}
-
-/// One sequencing dependency: run this fork after the referenced fork
-/// finishes at the same fork moment. Dependencies that don't fire at that
-/// moment are simply ignored. A fork may declare several (`after: [a, b]`);
-/// it runs once all of them finish, with every report piped in. At most one
-/// dependency may use `context: fork`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkAfter {
-    /// The fork to wait for.
-    pub fork: String,
-    /// What context the dependent fork gets.
-    pub context: ForkAfterContext,
-}
-
-/// The context a sequenced fork runs in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ForkAfterContext {
-    /// Fork the parent session as usual; the predecessor's final report is
-    /// piped into this fork's prompt.
-    #[default]
-    Parent,
-    /// Fork the *predecessor fork's* resulting session ("fork a fork"): this
-    /// fork sees everything the predecessor saw and did.
-    Fork,
+    vec![ForkRunOn::Idle { after_secs: None }]
 }
 
 /// A fork moment a fork fires at (`run_on`).
+///
+/// Only `Idle` and the three `Context*` variants are *supported* in v0.5 (see
+/// [`ForkRunOn::is_supported`]); the rest are recognized (so a migration
+/// warning can be produced) but never fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkRunOn {
     /// An idle pause. With `after_secs` unset, fires at the configured
     /// default idle deadline; with it set (`- idle: 20m`), fires once the
     /// session has been idle that long.
     Idle { after_secs: Option<u64> },
-    /// Context compaction (auto or manual).
-    Compact,
-    /// A new session starting.
-    SessionStart,
-    /// The session ending, for any reason.
-    SessionEnd,
-    /// The session ending *while recently active* (idle time below the
-    /// default idle deadline) — closed mid-conversation rather than timed
-    /// out.
-    ManualStop,
-    /// Daemon startup with this session still tracked (owed-fork sweep).
-    Boot,
     /// The session's prompt token count reached this absolute value.
     ContextTokens(u64),
     /// The session used at least this percentage of the model's context
-    /// window (requires a configured context window).
+    /// window.
     ContextUsedPct(u8),
     /// At most this many tokens remain in the model's context window.
     ContextLeft(u64),
+    /// Context compaction. Not supported since v0.5 (never fires).
+    Compact,
+    /// A new session starting. Not supported since v0.5 (never fires).
+    SessionStart,
+    /// The session ending. Not supported since v0.5 (never fires).
+    SessionEnd,
+    /// The session ending while recently active. Not supported since v0.5.
+    ManualStop,
+    /// Daemon startup found this session. Not supported since v0.5.
+    Boot,
 }
 
 impl ForkRunOn {
-    /// Stable label used in fire frontmatter and (for context triggers) as
-    /// the once-per-session latch key.
+    /// Stable label used in wake payloads and (for context triggers) as the
+    /// once-per-session latch key.
     pub fn label(&self) -> String {
         match self {
             ForkRunOn::Idle { after_secs: None } => "idle".into(),
             ForkRunOn::Idle {
                 after_secs: Some(s),
             } => format!("idle:{s}"),
+            ForkRunOn::ContextTokens(n) => format!("context_tokens:{n}"),
+            ForkRunOn::ContextUsedPct(p) => format!("context_used:{p}%"),
+            ForkRunOn::ContextLeft(n) => format!("context_left:{n}"),
             ForkRunOn::Compact => "compact".into(),
             ForkRunOn::SessionStart => "session_start".into(),
             ForkRunOn::SessionEnd => "session_end".into(),
             ForkRunOn::ManualStop => "manual_stop".into(),
             ForkRunOn::Boot => "boot".into(),
-            ForkRunOn::ContextTokens(n) => format!("context_tokens:{n}"),
-            ForkRunOn::ContextUsedPct(p) => format!("context_used:{p}%"),
-            ForkRunOn::ContextLeft(n) => format!("context_left:{n}"),
         }
+    }
+
+    /// Whether this trigger can fire under the v0.5 wake-and-spawn model.
+    pub fn is_supported(&self) -> bool {
+        matches!(
+            self,
+            ForkRunOn::Idle { .. }
+                | ForkRunOn::ContextTokens(_)
+                | ForkRunOn::ContextUsedPct(_)
+                | ForkRunOn::ContextLeft(_)
+        )
     }
 }
 
@@ -213,44 +180,37 @@ fn parse_run_on_entry(v: &serde_yaml::Value, warnings: &mut Vec<String>) -> Opti
 }
 
 /// Parse one `after` entry: a plain fork-name string, or a map
-/// `{fork: <name>, context: parent|fork}` (`skill:` accepted as an alias for
-/// the key, for definitions shared with other tools).
+/// `{fork: <name>}` (`skill:` accepted as an alias for the key, for
+/// definitions shared with other tools). A `context:` sub-key is accepted for
+/// backward compatibility but ignored with a warning (v0.5 dependents inherit
+/// the parent session, never a predecessor's).
 fn parse_after_entry(
     v: &serde_yaml::Value,
     name: &str,
     warnings: &mut Vec<String>,
-) -> Option<ForkAfter> {
+) -> Option<String> {
     match v {
-        serde_yaml::Value::String(s) if !s.trim().is_empty() => Some(ForkAfter {
-            fork: s.trim().to_string(),
-            context: ForkAfterContext::Parent,
-        }),
+        serde_yaml::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         serde_yaml::Value::Mapping(m) => {
             let get = |k: &str| {
                 m.get(serde_yaml::Value::String(k.into()))
                     .and_then(|v| v.as_str())
             };
+            if get("context").is_some() {
+                warnings.push(format!(
+                    "fork '{name}': after 'context' is ignored since v0.5 (dependents inherit the parent session)"
+                ));
+            }
             let dep = get("fork")
                 .or_else(|| get("skill"))
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let Some(dep) = dep else {
+            if dep.is_none() {
                 warnings.push(format!(
                     "fork '{name}': after entry is missing 'fork', ignoring"
                 ));
-                return None;
-            };
-            let context = match get("context") {
-                Some("fork") => ForkAfterContext::Fork,
-                Some("parent") | None => ForkAfterContext::Parent,
-                Some(other) => {
-                    warnings.push(format!(
-                        "fork '{name}': unknown after context '{other}'; using 'parent'"
-                    ));
-                    ForkAfterContext::Parent
-                }
-            };
-            Some(ForkAfter { fork: dep, context })
+            }
+            dep
         }
         _ => {
             warnings.push(format!("fork '{name}': malformed after value, ignoring"));
@@ -260,11 +220,9 @@ fn parse_after_entry(
 }
 
 /// Parse the full `after` value: one entry, or a list of entries. Duplicates
-/// and self-references are dropped, and at most one entry may keep
-/// `context: fork` (extras downgrade to `parent` — a fork can only resume
-/// one predecessor's session).
-fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Vec<ForkAfter> {
-    let entries: Vec<ForkAfter> = match v {
+/// and self-references are dropped.
+fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Vec<String> {
+    let entries: Vec<String> = match v {
         serde_yaml::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|e| parse_after_entry(e, name, warnings))
@@ -273,32 +231,19 @@ fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
             .into_iter()
             .collect(),
     };
-    let mut out: Vec<ForkAfter> = Vec::new();
-    let mut fork_context_seen = false;
-    for mut entry in entries {
-        if entry.fork == name {
+    let mut out: Vec<String> = Vec::new();
+    for dep in entries {
+        if dep == name {
             warnings.push(format!("fork '{name}': after references itself, ignoring"));
             continue;
         }
-        if out.iter().any(|e| e.fork == entry.fork) {
+        if out.iter().any(|e| e == &dep) {
             warnings.push(format!(
-                "fork '{name}': duplicate after entry '{}', ignoring",
-                entry.fork
+                "fork '{name}': duplicate after entry '{dep}', ignoring"
             ));
             continue;
         }
-        if entry.context == ForkAfterContext::Fork {
-            if fork_context_seen {
-                warnings.push(format!(
-                    "fork '{name}': only one after entry may use context 'fork'; \
-                     '{}' downgraded to 'parent'",
-                    entry.fork
-                ));
-                entry.context = ForkAfterContext::Parent;
-            }
-            fork_context_seen = true;
-        }
-        out.push(entry);
+        out.push(dep);
     }
     out
 }
@@ -306,7 +251,6 @@ fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
 /// Parse the `tags` value: a scalar string (comma-split) or a list of
 /// strings (each still comma-split for convenience). Entries are trimmed,
 /// empties dropped, and duplicates removed with the first occurrence kept.
-/// Non-string entries warn and are skipped; the fork stays valid.
 fn parse_tags(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Vec<String> {
     fn push_split(s: &str, out: &mut Vec<String>) {
         for piece in s.split(',') {
@@ -337,66 +281,15 @@ fn parse_tags(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> 
     out
 }
 
-/// Parse the `allowed_tools` value: a scalar string or a list of strings.
-/// Entries are trimmed and empties dropped, but — unlike `tags` — never
-/// comma-split, since a permission rule (`Bash(git add:*)`) is an opaque
-/// string that may itself contain commas. Non-string entries warn and skip.
-fn parse_allowed_tools(
-    v: &serde_yaml::Value,
-    name: &str,
-    warnings: &mut Vec<String>,
-) -> Vec<String> {
-    fn push_one(s: &str, out: &mut Vec<String>) {
-        let t = s.trim();
-        if !t.is_empty() && !out.iter().any(|e| e == t) {
-            out.push(t.to_string());
-        }
-    }
-    let mut out: Vec<String> = Vec::new();
-    match v {
-        serde_yaml::Value::String(s) => push_one(s, &mut out),
-        serde_yaml::Value::Sequence(seq) => {
-            for entry in seq {
-                match entry {
-                    serde_yaml::Value::String(s) => push_one(s, &mut out),
-                    _ => warnings.push(format!(
-                        "fork '{name}': allowed_tools entry is not a string, skipping"
-                    )),
-                }
-            }
-        }
-        serde_yaml::Value::Null => {}
-        _ => warnings.push(format!(
-            "fork '{name}': allowed_tools must be a string or a list of strings, ignoring"
-        )),
-    }
-    out
-}
-
-/// Parse `permission_mode`: one of the claude headless modes. `plan` is
-/// rejected (a headless fork can't act on a plan); unknown values warn and
-/// yield `None` (no flag emitted).
-fn parse_permission_mode(v: &str, name: &str, warnings: &mut Vec<String>) -> Option<String> {
-    match v.trim() {
-        "" => None,
-        m @ ("default" | "acceptEdits" | "bypassPermissions") => Some(m.to_string()),
-        other => {
-            warnings.push(format!(
-                "fork '{name}': unknown permission_mode '{other}', ignoring"
-            ));
-            None
-        }
-    }
-}
-
 #[derive(Deserialize, Default)]
 struct RawFork {
+    // The v0.5 fork marker (`fork: true`). Absent or `false` = not a fork.
+    #[serde(default)]
+    fork: Option<serde_yaml::Value>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     run_on: Option<Vec<serde_yaml::Value>>,
-    #[serde(default)]
-    delivery: Option<String>,
     #[serde(default)]
     throttle: Option<serde_yaml::Value>,
     #[serde(default)]
@@ -404,13 +297,16 @@ struct RawFork {
     #[serde(default)]
     overlap: Option<serde_yaml::Value>,
     #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
     tags: Option<serde_yaml::Value>,
+    // Deprecated since v0.5: parsed only to warn, then ignored.
+    #[serde(default)]
+    delivery: Option<serde_yaml::Value>,
+    #[serde(default)]
+    model: Option<serde_yaml::Value>,
     #[serde(default)]
     allowed_tools: Option<serde_yaml::Value>,
     #[serde(default)]
-    permission_mode: Option<String>,
+    permission_mode: Option<serde_yaml::Value>,
     // Recognized-and-rejected: the format has no RAG surface.
     #[serde(default)]
     rag: Option<serde_yaml::Value>,
@@ -418,8 +314,30 @@ struct RawFork {
     triggers: Option<serde_yaml::Value>,
 }
 
-/// The result of parsing a fork file: the validated definition, its prompt
-/// body, and any warnings produced by fallbacks.
+impl RawFork {
+    /// True if `fork: true`.
+    fn is_marked(&self) -> bool {
+        matches!(&self.fork, Some(serde_yaml::Value::Bool(true)))
+    }
+
+    /// True if the frontmatter carries any key that only a fork would set — a
+    /// likely `fork: true` migration mistake when the marker is absent.
+    fn has_fork_like_keys(&self) -> bool {
+        self.description.is_some()
+            || self.run_on.is_some()
+            || self.throttle.is_some()
+            || self.after.is_some()
+            || self.overlap.is_some()
+            || self.tags.is_some()
+            || self.delivery.is_some()
+            || self.model.is_some()
+            || self.allowed_tools.is_some()
+            || self.permission_mode.is_some()
+    }
+}
+
+/// The result of parsing a fork definition (frontmatter only; the body is the
+/// prompt), plus any warnings produced by fallbacks.
 #[derive(Debug, Clone)]
 pub struct ParsedFork {
     pub def: ForkDef,
@@ -427,9 +345,22 @@ pub struct ParsedFork {
     pub warnings: Vec<String>,
 }
 
+/// The outcome of parsing a `.md` file in a forks tree.
+#[derive(Debug, Clone)]
+pub enum ForkParse {
+    /// A real fork (frontmatter carried `fork: true`).
+    Fork(ParsedFork),
+    /// Not a fork: no `fork: true`. `fork_like` is true when the frontmatter
+    /// nevertheless carries fork keys (a likely migration mistake worth
+    /// warning about); false for a plain companion note or explicit
+    /// `fork: false`.
+    NotFork { fork_like: bool },
+    /// A frontmatter block is present but is not valid YAML.
+    Invalid,
+}
+
 /// Split a markdown file into its `---`-delimited YAML frontmatter and body.
-/// Files without frontmatter are valid: an all-defaults fork whose whole
-/// content is the body.
+/// Files without frontmatter are valid: their whole content is the body.
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     let Some(rest) = content.strip_prefix("---") else {
         return (None, content);
@@ -458,21 +389,31 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
 }
 
 /// Parse a fork file's full content. `name` is used only for warning text.
-/// Returns `None` when the frontmatter block exists but is not valid YAML —
-/// the one unrecoverable shape.
-pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
-    let mut warnings = Vec::new();
+pub fn parse_fork_file(name: &str, content: &str) -> ForkParse {
     let (front, body) = split_frontmatter(content);
     let raw: RawFork = match front {
-        None => RawFork::default(),
+        // No frontmatter at all: never a fork, and never fork-like.
+        None => return ForkParse::NotFork { fork_like: false },
         Some(yaml) => match serde_yaml::from_str(yaml) {
             Ok(raw) => raw,
             Err(e) => {
-                tracing::warn!(fork = name, error = %e, "Invalid fork frontmatter YAML, skipping fork");
-                return None;
+                tracing::debug!(fork = name, error = %e, "invalid fork frontmatter YAML");
+                return ForkParse::Invalid;
             }
         },
     };
+
+    // The v0.5 marker gate: only `fork: true` files are forks.
+    if !raw.is_marked() {
+        return ForkParse::NotFork {
+            // `fork: false` is an explicit opt-out (no warning); an absent
+            // marker on a file with fork keys is a likely migration mistake.
+            fork_like: !matches!(&raw.fork, Some(serde_yaml::Value::Bool(false)))
+                && raw.has_fork_like_keys(),
+        };
+    }
+
+    let mut warnings = Vec::new();
 
     if raw.rag.is_some() || raw.triggers.is_some() {
         warnings.push(format!(
@@ -480,22 +421,19 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         ));
     }
 
-    let delivery = match raw.delivery.as_deref() {
-        Some("discard") => ForkDelivery::Discard,
-        Some("next_turn") | None => ForkDelivery::NextTurn,
-        Some("immediate") => {
-            warnings.push(format!(
-                "fork '{name}': delivery 'immediate' is not supported here; using 'next_turn'"
-            ));
-            ForkDelivery::NextTurn
-        }
-        Some(other) => {
-            warnings.push(format!(
-                "fork '{name}': unknown delivery '{other}'; using 'next_turn'"
-            ));
-            ForkDelivery::NextTurn
-        }
-    };
+    // Deprecated-and-ignored keys.
+    if raw.delivery.is_some() || raw.model.is_some() {
+        warnings.push(format!(
+            "fork '{name}': v0.5 ignores 'delivery' and 'model' — delivery is native \
+             and the fork inherits the session's model"
+        ));
+    }
+    if raw.allowed_tools.is_some() || raw.permission_mode.is_some() {
+        warnings.push(format!(
+            "fork '{name}': v0.5 ignores 'allowed_tools' and 'permission_mode' — a fork \
+             inherits the session's permissions"
+        ));
+    }
 
     let throttle_secs = match &raw.throttle {
         None => None,
@@ -526,6 +464,26 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         }
     };
 
+    // Warn about unsupported moments; a fork with only unsupported ones will
+    // never fire.
+    let mut seen_unsupported: Vec<String> = Vec::new();
+    for trigger in &run_on {
+        if !trigger.is_supported() {
+            let label = trigger.label();
+            if !seen_unsupported.iter().any(|l| l == &label) {
+                warnings.push(format!(
+                    "fork '{name}': run_on '{label}' is not supported since v0.5, ignoring"
+                ));
+                seen_unsupported.push(label);
+            }
+        }
+    }
+    if !run_on.iter().any(|t| t.is_supported()) {
+        warnings.push(format!(
+            "fork '{name}': no supported run_on moments (idle / context_*); it will never fire"
+        ));
+    }
+
     let after = raw
         .after
         .as_ref()
@@ -549,33 +507,18 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         .map(|v| parse_tags(v, name, &mut warnings))
         .unwrap_or_default();
 
-    let allowed_tools = raw
-        .allowed_tools
-        .as_ref()
-        .map(|v| parse_allowed_tools(v, name, &mut warnings))
-        .unwrap_or_default();
-
-    let permission_mode = raw
-        .permission_mode
-        .as_deref()
-        .and_then(|v| parse_permission_mode(v, name, &mut warnings));
-
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
     }
 
-    Some(ParsedFork {
+    ForkParse::Fork(ParsedFork {
         def: ForkDef {
             description: raw.description.filter(|d| !d.trim().is_empty()),
             run_on,
-            delivery,
             throttle_secs,
             after,
             overlap,
-            model: raw.model.filter(|m| !m.trim().is_empty()),
             tags,
-            allowed_tools,
-            permission_mode,
         },
         body: body.to_string(),
         warnings,
@@ -587,36 +530,73 @@ mod tests {
     use super::*;
 
     fn parse(content: &str) -> ParsedFork {
-        parse_fork_file("test", content).expect("parse")
+        match parse_fork_file("test", content) {
+            ForkParse::Fork(p) => p,
+            other => panic!("expected a fork, got {other:?}"),
+        }
     }
 
     #[test]
-    fn defaults_without_frontmatter() {
-        let p = parse("just a body\n");
-        assert_eq!(p.def, ForkDef::default());
-        assert_eq!(p.body, "just a body\n");
-        assert!(p.warnings.is_empty());
+    fn marker_required_absent_plain_note_is_silent() {
+        // A companion note with no frontmatter is silently not a fork.
+        assert!(matches!(
+            parse_fork_file("note", "just reference material\n"),
+            ForkParse::NotFork { fork_like: false }
+        ));
+        // Frontmatter without the marker and without fork-like keys: silent.
+        assert!(matches!(
+            parse_fork_file("note", "---\ntitle: notes\n---\nbody"),
+            ForkParse::NotFork { fork_like: false }
+        ));
     }
 
     #[test]
-    fn defaults_with_empty_frontmatter() {
-        let p = parse("---\ndescription: hi\n---\nbody");
+    fn marker_absent_with_fork_like_keys_warns() {
+        assert!(matches!(
+            parse_fork_file("j", "---\nrun_on: [idle]\n---\nbody"),
+            ForkParse::NotFork { fork_like: true }
+        ));
+        assert!(matches!(
+            parse_fork_file("j", "---\ndescription: hi\nthrottle: 1h\n---\nb"),
+            ForkParse::NotFork { fork_like: true }
+        ));
+    }
+
+    #[test]
+    fn fork_false_is_silent_optout() {
+        assert!(matches!(
+            parse_fork_file("j", "---\nfork: false\nrun_on: [idle]\n---\nbody"),
+            ForkParse::NotFork { fork_like: false }
+        ));
+    }
+
+    #[test]
+    fn marker_present_is_a_fork() {
+        let p = parse("---\nfork: true\ndescription: hi\n---\nbody");
         assert_eq!(p.def.description.as_deref(), Some("hi"));
         assert_eq!(p.def.run_on, default_run_on());
-        assert_eq!(p.def.delivery, ForkDelivery::NextTurn);
         assert_eq!(p.body, "body");
+    }
+
+    #[test]
+    fn default_run_on_is_just_idle() {
+        assert_eq!(default_run_on(), vec![ForkRunOn::Idle { after_secs: None }]);
+        let p = parse("---\nfork: true\n---\n");
+        assert_eq!(p.def.run_on, vec![ForkRunOn::Idle { after_secs: None }]);
+        assert!(p.warnings.is_empty());
     }
 
     #[test]
     fn full_config() {
         let p = parse(
             "---\n\
+             fork: true\n\
              description: d\n\
-             run_on:\n  - idle: 10m\n  - compact\n  - session_end\n\
-             delivery: discard\n\
+             run_on:\n  - idle: 10m\n  - context_used: 80%\n\
              throttle: 30m\n\
              after: journal\n\
-             model: haiku\n\
+             tags: [ci, review]\n\
+             overlap: true\n\
              ---\nbody",
         );
         assert_eq!(
@@ -625,46 +605,36 @@ mod tests {
                 ForkRunOn::Idle {
                     after_secs: Some(600)
                 },
-                ForkRunOn::Compact,
-                ForkRunOn::SessionEnd
+                ForkRunOn::ContextUsedPct(80),
             ]
         );
-        assert_eq!(p.def.delivery, ForkDelivery::Discard);
         assert_eq!(p.def.throttle_secs, Some(1800));
-        assert_eq!(
-            p.def.after,
-            vec![ForkAfter {
-                fork: "journal".into(),
-                context: ForkAfterContext::Parent
-            }]
-        );
-        assert_eq!(p.def.model.as_deref(), Some("haiku"));
+        assert_eq!(p.def.after, vec!["journal".to_string()]);
+        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
+        assert!(p.def.overlap);
         assert!(p.warnings.is_empty());
     }
 
     #[test]
-    fn run_on_all_string_forms() {
-        let p = parse(
-            "---\nrun_on: [idle, compact, compaction, session_start, session_end, manual_stop, boot]\n---\n",
-        );
+    fn unsupported_moment_warns_and_only_unsupported_never_fires() {
+        // idle stays supported; compact warns but the fork still fires on idle.
+        let p = parse("---\nfork: true\nrun_on: [idle, compact]\n---\n");
         assert_eq!(
             p.def.run_on,
-            vec![
-                ForkRunOn::Idle { after_secs: None },
-                ForkRunOn::Compact,
-                ForkRunOn::Compact,
-                ForkRunOn::SessionStart,
-                ForkRunOn::SessionEnd,
-                ForkRunOn::ManualStop,
-                ForkRunOn::Boot,
-            ]
+            vec![ForkRunOn::Idle { after_secs: None }, ForkRunOn::Compact]
         );
+        assert!(p.warnings.iter().any(|w| w.contains("compact")));
+        assert!(!p.warnings.iter().any(|w| w.contains("never fire")));
+
+        // Only unsupported moments: the "never fire" warning appears.
+        let p = parse("---\nfork: true\nrun_on: [session_end, boot]\n---\n");
+        assert!(p.warnings.iter().any(|w| w.contains("never fire")));
     }
 
     #[test]
-    fn run_on_context_thresholds() {
+    fn context_thresholds() {
         let p = parse(
-            "---\nrun_on:\n  - context_tokens: 150000\n  - context_used: 80%\n  - context_left: 20000\n---\n",
+            "---\nfork: true\nrun_on:\n  - context_tokens: 150000\n  - context_used: 80%\n  - context_left: 20000\n---\n",
         );
         assert_eq!(
             p.def.run_on,
@@ -675,252 +645,108 @@ mod tests {
             ]
         );
         assert_eq!(p.def.run_on[1].label(), "context_used:80%");
-    }
-
-    #[test]
-    fn unknown_run_on_falls_back_to_defaults() {
-        let p = parse("---\nrun_on: [flarp]\n---\n");
-        assert_eq!(p.def.run_on, default_run_on());
-        assert_eq!(p.warnings.len(), 2); // unknown trigger + empty fallback
-    }
-
-    #[test]
-    fn partial_run_on_keeps_valid_entries() {
-        let p = parse("---\nrun_on: [flarp, boot]\n---\n");
-        assert_eq!(p.def.run_on, vec![ForkRunOn::Boot]);
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn immediate_delivery_downgrades_with_warning() {
-        let p = parse("---\ndelivery: immediate\nthrottle: 1h\n---\n");
-        assert_eq!(p.def.delivery, ForkDelivery::NextTurn);
-        assert!(p.warnings.iter().any(|w| w.contains("immediate")));
-    }
-
-    #[test]
-    fn unknown_delivery_falls_back() {
-        let p = parse("---\ndelivery: pigeon\n---\n");
-        assert_eq!(p.def.delivery, ForkDelivery::NextTurn);
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn invalid_throttle_ignored() {
-        let p = parse("---\nthrottle: soon\n---\n");
-        assert_eq!(p.def.throttle_secs, None);
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn after_map_forms() {
-        let p = parse("---\nafter: {fork: journal, context: fork}\n---\n");
-        assert_eq!(
-            p.def.after,
-            vec![ForkAfter {
-                fork: "journal".into(),
-                context: ForkAfterContext::Fork
-            }]
-        );
-        // `skill:` alias for definitions shared with other tools.
-        let p = parse("---\nafter: {skill: journal}\n---\n");
-        assert_eq!(
-            p.def.after,
-            vec![ForkAfter {
-                fork: "journal".into(),
-                context: ForkAfterContext::Parent
-            }]
-        );
-        let p = parse("---\nafter: {context: fork}\n---\n");
-        assert!(p.def.after.is_empty());
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn after_list_forms() {
-        let p = parse("---\nafter: [a, {fork: b, context: fork}, c]\n---\n");
-        assert_eq!(
-            p.def.after,
-            vec![
-                ForkAfter {
-                    fork: "a".into(),
-                    context: ForkAfterContext::Parent
-                },
-                ForkAfter {
-                    fork: "b".into(),
-                    context: ForkAfterContext::Fork
-                },
-                ForkAfter {
-                    fork: "c".into(),
-                    context: ForkAfterContext::Parent
-                },
-            ]
-        );
         assert!(p.warnings.is_empty());
-
-        // Duplicates dropped; second context:fork downgraded; bad entries skipped.
-        let p = parse(
-            "---\nafter:\n  - a\n  - a\n  - {fork: b, context: fork}\n  - {fork: c, context: fork}\n  - 42\n---\n",
-        );
-        assert_eq!(
-            p.def.after,
-            vec![
-                ForkAfter {
-                    fork: "a".into(),
-                    context: ForkAfterContext::Parent
-                },
-                ForkAfter {
-                    fork: "b".into(),
-                    context: ForkAfterContext::Fork
-                },
-                ForkAfter {
-                    fork: "c".into(),
-                    context: ForkAfterContext::Parent
-                },
-            ]
-        );
-        assert_eq!(p.warnings.len(), 3);
     }
 
     #[test]
-    fn after_self_reference_dropped() {
-        let p = parse_fork_file("me", "---\nafter: me\n---\n").unwrap();
-        assert!(p.def.after.is_empty());
+    fn deprecated_keys_warn_and_are_ignored() {
+        let p = parse(
+            "---\nfork: true\nmodel: haiku\ndelivery: discard\nallowed_tools: [Write]\npermission_mode: acceptEdits\n---\n",
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("delivery")));
+        assert!(p.warnings.iter().any(|w| w.contains("allowed_tools")));
+    }
+
+    #[test]
+    fn after_forms_names_only() {
+        let p = parse("---\nfork: true\nafter: [a, {fork: b}, c]\n---\n");
+        assert_eq!(p.def.after, vec!["a", "b", "c"]);
+        assert!(p.warnings.is_empty());
+        // `skill:` alias; `context:` is ignored with a warning.
+        let p = parse("---\nfork: true\nafter: {skill: journal, context: fork}\n---\n");
+        assert_eq!(p.def.after, vec!["journal".to_string()]);
+        assert!(p.warnings.iter().any(|w| w.contains("context")));
+    }
+
+    #[test]
+    fn after_self_and_dup_dropped() {
+        // Duplicate 'a' dropped (name is "test", so neither entry is a self-ref).
+        let p = parse("---\nfork: true\nafter: [a, b, a]\n---\n");
+        assert_eq!(p.def.after, vec!["a".to_string(), "b".to_string()]);
+        // Self-reference dropped, keeping the rest.
+        let p = match parse_fork_file("me", "---\nfork: true\nafter: [other, me]\n---\n") {
+            ForkParse::Fork(p) => p,
+            _ => panic!(),
+        };
+        assert_eq!(p.def.after, vec!["other".to_string()]);
         assert_eq!(p.warnings.len(), 1);
-        // Also dropped from lists, keeping the rest.
-        let p = parse_fork_file("me", "---\nafter: [other, me]\n---\n").unwrap();
-        assert_eq!(p.def.after.len(), 1);
-        assert_eq!(p.def.after[0].fork, "other");
+    }
+
+    #[test]
+    fn tags_scalar_and_list() {
+        assert_eq!(
+            parse("---\nfork: true\ntags: ci\n---\n").def.tags,
+            vec!["ci"]
+        );
+        assert_eq!(
+            parse("---\nfork: true\ntags: ci, review ,docs\n---\n")
+                .def
+                .tags,
+            vec!["ci", "review", "docs"]
+        );
+        assert_eq!(
+            parse("---\nfork: true\ntags: [ci, review]\n---\n").def.tags,
+            vec!["ci", "review"]
+        );
     }
 
     #[test]
     fn overlap_parsing() {
-        assert!(!parse("---\ndescription: d\n---\n").def.overlap);
-        assert!(parse("---\noverlap: true\n---\n").def.overlap);
-        assert!(!parse("---\noverlap: false\n---\n").def.overlap);
-        let p = parse("---\noverlap: sometimes\n---\n");
+        assert!(!parse("---\nfork: true\ndescription: d\n---\n").def.overlap);
+        assert!(parse("---\nfork: true\noverlap: true\n---\n").def.overlap);
+        let p = parse("---\nfork: true\noverlap: sometimes\n---\n");
         assert!(!p.def.overlap);
-        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings.iter().any(|w| w.contains("overlap")));
+    }
+
+    #[test]
+    fn invalid_throttle_ignored() {
+        let p = parse("---\nfork: true\nthrottle: soon\n---\n");
+        assert_eq!(p.def.throttle_secs, None);
+        assert!(p.warnings.iter().any(|w| w.contains("throttle")));
+    }
+
+    #[test]
+    fn unknown_run_on_falls_back_to_defaults() {
+        let p = parse("---\nfork: true\nrun_on: [flarp]\n---\n");
+        assert_eq!(p.def.run_on, default_run_on());
+        assert!(p.warnings.iter().any(|w| w.contains("flarp")));
     }
 
     #[test]
     fn rag_keys_rejected_with_warning() {
-        let p = parse("---\nrag:\n  triggers: [x]\n---\n");
-        assert!(p.warnings.iter().any(|w| w.contains("RAG")));
-        let p = parse("---\ntriggers: [x]\n---\n");
+        let p = parse("---\nfork: true\ntriggers: [x]\n---\n");
         assert!(p.warnings.iter().any(|w| w.contains("RAG")));
     }
 
     #[test]
     fn unknown_keys_ignored() {
-        let p = parse("---\nfuture_key: whatever\ndescription: d\n---\nb");
+        let p = parse("---\nfork: true\nfuture_key: whatever\ndescription: d\n---\nb");
         assert!(p.warnings.is_empty());
         assert_eq!(p.def.description.as_deref(), Some("d"));
     }
 
     #[test]
-    fn tags_as_list() {
-        let p = parse("---\ntags: [ci, review]\n---\n");
-        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn tags_as_scalar() {
-        let p = parse("---\ntags: ci\n---\n");
-        assert_eq!(p.def.tags, vec!["ci".to_string()]);
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn tags_scalar_with_commas_is_split() {
-        let p = parse("---\ntags: ci, review ,docs\n---\n");
-        assert_eq!(
-            p.def.tags,
-            vec!["ci".to_string(), "review".to_string(), "docs".to_string()]
-        );
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn tags_non_string_entries_warn_and_skip() {
-        let p = parse("---\ntags: [ci, 42, review]\n---\n");
-        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn tags_absent_is_empty() {
-        let p = parse("---\ndescription: d\n---\n");
-        assert!(p.def.tags.is_empty());
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn tags_trimmed_and_deduped() {
-        let p = parse("---\ntags: [ci, ci , '  review  ', '']\n---\n");
-        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn allowed_tools_as_list() {
-        let p = parse("---\nallowed_tools: [Write, 'Bash(git add:*)']\n---\n");
-        assert_eq!(
-            p.def.allowed_tools,
-            vec!["Write".to_string(), "Bash(git add:*)".to_string()]
-        );
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn allowed_tools_as_scalar_is_not_comma_split() {
-        // A single rule may contain commas and must survive intact.
-        let p = parse("---\nallowed_tools: 'Bash(git add:*, git commit:*)'\n---\n");
-        assert_eq!(p.def.allowed_tools, vec!["Bash(git add:*, git commit:*)"]);
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn allowed_tools_junk_entry_warns_and_skips() {
-        let p = parse("---\nallowed_tools: [Write, 42, Edit]\n---\n");
-        assert_eq!(
-            p.def.allowed_tools,
-            vec!["Write".to_string(), "Edit".to_string()]
-        );
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn permission_mode_valid_and_unknown() {
-        let p = parse("---\npermission_mode: acceptEdits\n---\n");
-        assert_eq!(p.def.permission_mode.as_deref(), Some("acceptEdits"));
-        assert!(p.warnings.is_empty());
-        // `plan` is a valid claude mode but nonsensical for a headless fork.
-        let p = parse("---\npermission_mode: plan\n---\n");
-        assert_eq!(p.def.permission_mode, None);
-        assert_eq!(p.warnings.len(), 1);
-        let p = parse("---\npermission_mode: pigeon\n---\n");
-        assert_eq!(p.def.permission_mode, None);
-        assert_eq!(p.warnings.len(), 1);
-    }
-
-    #[test]
-    fn permissions_absent_default_empty() {
-        let p = parse("---\ndescription: d\n---\n");
-        assert!(p.def.allowed_tools.is_empty());
-        assert_eq!(p.def.permission_mode, None);
-        assert!(p.warnings.is_empty());
-    }
-
-    #[test]
-    fn invalid_yaml_drops_fork() {
-        assert!(parse_fork_file("x", "---\n: [unclosed\n---\nb").is_none());
+    fn invalid_yaml_is_invalid() {
+        assert!(matches!(
+            parse_fork_file("x", "---\n: [unclosed\n---\nb"),
+            ForkParse::Invalid
+        ));
     }
 
     #[test]
     fn frontmatter_closed_at_eof() {
-        let p = parse("---\ndescription: d\n---");
+        let p = parse("---\nfork: true\ndescription: d\n---");
         assert_eq!(p.def.description.as_deref(), Some("d"));
         assert_eq!(p.body, "");
     }

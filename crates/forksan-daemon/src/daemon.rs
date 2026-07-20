@@ -1,14 +1,22 @@
 //! Shared daemon state and Claude Code event handling.
+//!
+//! Since v0.5 the daemon is a pure scheduler: it never spawns fork
+//! subprocesses. The asyncRewake Stop hook long-polls via [`handle_stop_wait`];
+//! when forks come due the daemon answers with a wake payload the session's own
+//! model acts on (spawning `fork` subagents). Fast events (SessionStart,
+//! PromptSubmit, SessionEnd) just keep session bookkeeping — and PromptSubmit /
+//! SessionEnd cancel any parked stop-wait.
 
 use forksan_core::config::{load_config_at, Config, Paths};
-use forksan_core::moments::ForkMoment;
-use forksan_core::protocol::{Event, EventKind, ResponseBody, WaitMode};
+use forksan_core::moments::{idle_deadlines, ForkMoment, DEFAULT_CONTEXT_WINDOW};
+use forksan_core::protocol::{Event, EventKind, ResponseBody};
 use forksan_core::store::Store;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -17,20 +25,38 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-pub struct SessionRuntime {
-    pub idle_timer: Option<tokio::task::JoinHandle<()>>,
+/// Every fork moment that has elapsed for a session by `up_to`: the context
+/// gauge (if known, always "elapsed" the instant the turn ended) plus every
+/// idle deadline whose fire time (`base + d`) has passed.
+fn elapsed_moments(
+    prompt_tokens: Option<u64>,
+    base: i64,
+    deadlines: &[u64],
+    up_to: i64,
+) -> Vec<ForkMoment> {
+    let mut moments = Vec::new();
+    if let Some(pt) = prompt_tokens {
+        moments.push(ForkMoment::Context {
+            prompt_tokens: pt,
+            max_tokens: Some(DEFAULT_CONTEXT_WINDOW),
+        });
+    }
+    for &d in deadlines {
+        if base + d as i64 <= up_to {
+            moments.push(ForkMoment::Idle { deadline_secs: d });
+        }
+    }
+    moments
 }
 
 pub struct Daemon {
     pub paths: Paths,
     pub store: Mutex<Store>,
-    pub sessions: Mutex<HashMap<String, SessionRuntime>>,
-    /// Per-(project, fork) serialization gates (`overlap: false`).
-    pub run_gates: crate::gates::RunGates,
-    pub active_runs: AtomicUsize,
+    /// Per-session cancellation channels for parked stop-wait long polls.
+    /// Sending `()` (or dropping) resolves the parked poll as `Waited`.
+    pub waits: Mutex<HashMap<String, oneshot::Sender<()>>>,
     pub connections: AtomicUsize,
     pub last_busy: AtomicI64,
-    pub draining: AtomicBool,
     pub shutdown: tokio::sync::Notify,
 }
 
@@ -39,12 +65,9 @@ impl Daemon {
         Arc::new(Self {
             paths,
             store: Mutex::new(store),
-            sessions: Mutex::new(HashMap::new()),
-            run_gates: crate::gates::RunGates::default(),
-            active_runs: AtomicUsize::new(0),
+            waits: Mutex::new(HashMap::new()),
             connections: AtomicUsize::new(0),
             last_busy: AtomicI64::new(now()),
-            draining: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
         })
     }
@@ -67,48 +90,32 @@ impl Daemon {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// Handle one lifecycle event; returns the response body.
+    /// Cancel a parked stop-wait for a session (resolves it as `Waited`).
+    fn cancel_wait(&self, session_id: &str) {
+        if let Some(tx) = self.waits.lock().unwrap().remove(session_id) {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Handle one fast lifecycle event; returns the response body.
     pub async fn handle_event(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
         let t = now();
-        // The per-session tag filter rides on every event; persist it
-        // comma-joined so the latest event's values win on the session row.
         let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
         let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
         match ev.event {
             EventKind::SessionStart => {
-                {
-                    let store = self.store.lock().unwrap();
-                    let _ = store.upsert_session(
-                        &ev.session_id,
-                        &ev.project_root,
-                        &ev.cwd,
-                        ev.transcript_path.as_deref(),
-                        ev.model.as_deref(),
-                        enable_tags.as_deref(),
-                        disable_tags.as_deref(),
-                        t,
-                    );
-                }
-                // `startup`/`clear` are genuinely new sessions; `resume`
-                // re-registers under the new leg, `compact` is a
-                // continuation — neither re-fires session_start.
-                let fire = matches!(ev.source.as_deref(), Some("startup") | Some("clear") | None);
-                if fire {
-                    let daemon = self.clone();
-                    let sid = ev.session_id.clone();
-                    tokio::spawn(async move {
-                        crate::planner::run_moments(
-                            &daemon,
-                            &sid,
-                            &[ForkMoment::SessionStart],
-                            None,
-                            None,
-                        )
-                        .await;
-                    });
-                }
-                crate::idle::arm_idle_timer(self, &ev.session_id, t);
+                let store = self.store.lock().unwrap();
+                let _ = store.upsert_session(
+                    &ev.session_id,
+                    &ev.project_root,
+                    &ev.cwd,
+                    ev.transcript_path.as_deref(),
+                    ev.model.as_deref(),
+                    enable_tags.as_deref(),
+                    disable_tags.as_deref(),
+                    t,
+                );
                 ResponseBody::Ack
             }
             EventKind::PromptSubmit => {
@@ -126,158 +133,162 @@ impl Daemon {
                     );
                     let _ = store.set_last_activity(&ev.session_id, t);
                 }
-                // A turn is in flight: idle deadlines must not fire mid-turn.
-                crate::idle::cancel_idle_timer(self, &ev.session_id);
-                let cfg = self.cfg_for(Some(&ev.project_root));
-                let items = {
-                    let store = self.store.lock().unwrap();
-                    store
-                        .poll_reports(&ev.session_id, &ev.project_root, cfg.poll_budget_chars, t)
-                        .unwrap_or_default()
-                };
-                ResponseBody::Reports { items }
-            }
-            EventKind::Stop => {
-                {
-                    let store = self.store.lock().unwrap();
-                    let _ = store.upsert_session(
-                        &ev.session_id,
-                        &ev.project_root,
-                        &ev.cwd,
-                        ev.transcript_path.as_deref(),
-                        ev.model.as_deref(),
-                        enable_tags.as_deref(),
-                        disable_tags.as_deref(),
-                        t,
-                    );
-                    let _ = store.set_last_activity(&ev.session_id, t);
-                }
-                // Context gauge from the transcript, then context-threshold
-                // moments (latched once per session inside the planner).
-                if let Some(transcript) = ev.transcript_path.as_deref() {
-                    let session = {
-                        let store = self.store.lock().unwrap();
-                        store.get_session(&ev.session_id).ok().flatten()
-                    };
-                    if let Some(session) = session {
-                        match crate::transcript::read_gauge(transcript, session.transcript_offset) {
-                            Ok(gauge) => {
-                                {
-                                    let store = self.store.lock().unwrap();
-                                    let _ = store.set_transcript_gauge(
-                                        &ev.session_id,
-                                        gauge.new_offset,
-                                        gauge.prompt_tokens,
-                                    );
-                                }
-                                let tokens = gauge.prompt_tokens.or(session.prompt_tokens);
-                                if let Some(prompt_tokens) = tokens {
-                                    let cfg = self.cfg_for(Some(&ev.project_root));
-                                    let model = gauge.model.as_deref().or(session.model.as_deref());
-                                    let max_tokens = Some(cfg.window_for(model));
-                                    let daemon = self.clone();
-                                    let sid = ev.session_id.clone();
-                                    tokio::spawn(async move {
-                                        crate::planner::run_moments(
-                                            &daemon,
-                                            &sid,
-                                            &[ForkMoment::Context {
-                                                prompt_tokens,
-                                                max_tokens,
-                                            }],
-                                            None,
-                                            None,
-                                        )
-                                        .await;
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "transcript gauge unavailable");
-                            }
-                        }
-                    }
-                }
-                // End of turn: the idle clock starts now.
-                crate::idle::arm_idle_timer(self, &ev.session_id, t);
-                ResponseBody::Ack
-            }
-            EventKind::PreCompact => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let daemon = self.clone();
-                let sid = ev.session_id.clone();
-                tokio::spawn(async move {
-                    crate::planner::run_moments(
-                        &daemon,
-                        &sid,
-                        &[ForkMoment::Compact],
-                        None,
-                        Some(tx),
-                    )
-                    .await;
-                });
-                if ev.wait == WaitMode::ForksSpawned {
-                    // Ack once every matching fork's subprocess exists (they
-                    // snapshot the parent transcript at spawn), so compaction
-                    // may rewrite it freely afterward. Capped.
-                    let _ = tokio::time::timeout(Duration::from_secs(15), rx).await;
-                }
+                // A turn is in flight: cancel any parked stop-wait so no wake
+                // fires mid-turn.
+                self.cancel_wait(&ev.session_id);
                 ResponseBody::Ack
             }
             EventKind::SessionEnd => {
-                crate::idle::cancel_idle_timer(self, &ev.session_id);
-                let (last_activity, deadline) = {
-                    let store = self.store.lock().unwrap();
-                    let last = store
-                        .get_session(&ev.session_id)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.last_activity)
-                        .unwrap_or(t);
-                    (
-                        last,
-                        self.cfg_for(Some(&ev.project_root))
-                            .default_idle_deadline_secs,
-                    )
-                };
-                // Manual stop = closed while recently active: the idle forks
-                // never got their chance. The SessionEnd reason is metadata
-                // only (a `clear` after hours of idling is not manual).
-                let idle_secs = (t - last_activity).max(0) as u64;
-                let manual = deadline == 0 || idle_secs < deadline;
-                let daemon = self.clone();
-                let sid = ev.session_id.clone();
-                tokio::spawn(async move {
-                    crate::planner::run_moments(
-                        &daemon,
-                        &sid,
-                        &[ForkMoment::SessionEnd { manual }],
-                        None,
-                        None,
-                    )
-                    .await;
-                    // Close only after the plan ran (it needs the roster);
-                    // closing frees this session's reports for delivery to
-                    // successor sessions in the same project.
-                    let store = daemon.store.lock().unwrap();
-                    let _ = store.close_session(&sid);
-                });
+                self.cancel_wait(&ev.session_id);
+                let store = self.store.lock().unwrap();
+                let _ = store.close_session(&ev.session_id);
                 ResponseBody::Ack
+            }
+            // Stop never arrives as a plain event (it is a StopWait long poll).
+            EventKind::Stop => ResponseBody::Ack,
+        }
+    }
+
+    /// The asyncRewake Stop hook's long poll: record activity + the context
+    /// gauge, then wait until forks come due (returning a `Wake`) or the wait
+    /// is cancelled / the daemon retires (returning `Waited`).
+    pub async fn handle_stop_wait(self: &Arc<Self>, ev: Event) -> ResponseBody {
+        self.touch_busy();
+        let t = now();
+        let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
+        let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
+        {
+            let store = self.store.lock().unwrap();
+            let _ = store.upsert_session(
+                &ev.session_id,
+                &ev.project_root,
+                &ev.cwd,
+                ev.transcript_path.as_deref(),
+                ev.model.as_deref(),
+                enable_tags.as_deref(),
+                disable_tags.as_deref(),
+                t,
+            );
+            let _ = store.set_last_activity(&ev.session_id, t);
+        }
+        let prompt_tokens = self.read_gauge(&ev);
+        let cfg = self.cfg_for(Some(&ev.project_root));
+
+        // Register this wait so PromptSubmit / SessionEnd can cancel it. A
+        // stale wait for the same session (if any) is cancelled by the insert.
+        let (tx, mut rx) = oneshot::channel::<()>();
+        if let Some(old) = self.waits.lock().unwrap().insert(ev.session_id.clone(), tx) {
+            let _ = old.send(());
+        }
+
+        let Some(session) = ({
+            let store = self.store.lock().unwrap();
+            store.get_session(&ev.session_id).ok().flatten()
+        }) else {
+            return ResponseBody::Waited;
+        };
+
+        // Idle deadlines (seconds from the Stop) this session's forks need.
+        let deadlines = {
+            let (entries, _) = forksan_core::discovery::discover_forks(
+                &session.cwd,
+                Some(&self.user_forks_root()),
+            );
+            idle_deadlines(
+                entries.iter().map(|e| &e.parsed.def),
+                cfg.default_idle_deadline_secs,
+            )
+        };
+
+        // Phase A: find the first instant ≥1 fork is due (read-only eval).
+        // Context thresholds are known immediately (the turn just ended);
+        // idle forks come due as their deadlines elapse.
+        let due_now = |slf: &Arc<Self>| -> bool {
+            let moments = elapsed_moments(prompt_tokens, t, &deadlines, now());
+            !moments.is_empty()
+                && !crate::planner::select_forks(slf, &session, &cfg, &moments).is_empty()
+        };
+
+        let mut due = due_now(self);
+        if !due {
+            for &d in &deadlines {
+                let fire_at = t + d as i64;
+                let wait = (fire_at - now()).max(0) as u64;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {
+                        if due_now(self) { due = true; break; }
+                    }
+                    _ = &mut rx => return ResponseBody::Waited,
+                    _ = self.shutdown.notified() => return ResponseBody::Waited,
+                }
+            }
+        }
+        if !due {
+            // No deadline yielded anything; park until cancelled or shutdown.
+            tokio::select! {
+                _ = &mut rx => {}
+                _ = self.shutdown.notified() => {}
+            }
+            return ResponseBody::Waited;
+        }
+
+        // Phase B: debounce so near-simultaneous forks batch into one wake.
+        // Cancellation / shutdown during the window wins (nothing is stamped).
+        if cfg.wake_debounce_secs > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(cfg.wake_debounce_secs)) => {}
+                _ = &mut rx => return ResponseBody::Waited,
+                _ = self.shutdown.notified() => return ResponseBody::Waited,
+            }
+        }
+
+        // Phase C: re-evaluate over every moment elapsed by now (deadlines that
+        // landed during the debounce join the batch), then issue one wake —
+        // stamping throttles and latches at this point.
+        let moments = elapsed_moments(prompt_tokens, t, &deadlines, now());
+        let selected = crate::planner::select_forks(self, &session, &cfg, &moments);
+        if let Some(payload) = crate::planner::build_wake(self, &session, selected) {
+            return ResponseBody::Wake { payload };
+        }
+        // Nothing survived re-evaluation; park.
+        tokio::select! {
+            _ = &mut rx => {}
+            _ = self.shutdown.notified() => {}
+        }
+        ResponseBody::Waited
+    }
+
+    /// Read the transcript gauge (updating the stored offset) and return the
+    /// session's best-known prompt token count, or `None` when unavailable.
+    fn read_gauge(&self, ev: &Event) -> Option<u64> {
+        let transcript = ev.transcript_path.as_deref()?;
+        let session = {
+            let store = self.store.lock().unwrap();
+            store.get_session(&ev.session_id).ok().flatten()?
+        };
+        match crate::transcript::read_gauge(transcript, session.transcript_offset) {
+            Ok(gauge) => {
+                {
+                    let store = self.store.lock().unwrap();
+                    let _ = store.set_transcript_gauge(
+                        &ev.session_id,
+                        gauge.new_offset,
+                        gauge.prompt_tokens,
+                    );
+                }
+                gauge.prompt_tokens.or(session.prompt_tokens)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "transcript gauge unavailable");
+                session.prompt_tokens
             }
         }
     }
 
-    /// True when the daemon has nothing to live for right now.
+    /// True when the daemon has nothing to live for right now (no open
+    /// connection, which includes any parked stop-wait).
     pub fn is_quiet(&self) -> bool {
-        if self.active_runs.load(Ordering::SeqCst) > 0
-            || self.connections.load(Ordering::SeqCst) > 0
-        {
-            return false;
-        }
-        let sessions = self.sessions.lock().unwrap();
-        !sessions
-            .values()
-            .any(|s| s.idle_timer.as_ref().is_some_and(|h| !h.is_finished()))
+        self.connections.load(Ordering::SeqCst) == 0
     }
 
     /// Exit once quiet for the configured period.
@@ -294,16 +305,10 @@ impl Daemon {
         }
     }
 
-    /// Begin shutdown; with `drain`, wait for in-flight fork runs first.
-    pub async fn request_shutdown(self: &Arc<Self>, drain: bool) {
-        self.draining.store(true, Ordering::SeqCst);
-        if drain {
-            let deadline = Duration::from_secs(self.cfg_for(None).fork_timeout_secs + 30);
-            let start = std::time::Instant::now();
-            while self.active_runs.load(Ordering::SeqCst) > 0 && start.elapsed() < deadline {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
+    /// Begin shutdown. Parked stop-waits resolve (`Waited`) via the shutdown
+    /// notify; `drain` is accepted for wire compatibility but there are no
+    /// in-flight runs to drain.
+    pub async fn request_shutdown(self: &Arc<Self>, _drain: bool) {
         self.shutdown.notify_waiters();
     }
 }

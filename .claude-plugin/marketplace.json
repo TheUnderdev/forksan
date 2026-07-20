@@ -8,7 +8,7 @@
     {
       "name": "forksan",
       "source": "./plugin",
-      "description": "Forks for Claude Code: throwaway forked-context runs at lifecycle moments, reports injected back into your session."
+      "description": "Forks for Claude Code: at idle and context-threshold moments your session spawns background fork subagents that inherit its context and report back."
     }
   ]
 }

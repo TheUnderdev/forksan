@@ -1,11 +1,13 @@
 #!/bin/sh
 # forksan hook shim: exec the persistent-data binary (it survives plugin
-# updates), or kick off a background bootstrap when it's missing. A hook
-# must never break the session, so every path here exits 0.
+# updates), or kick off a background bootstrap when it's missing. `exec`
+# propagates the binary's exit code — the Stop hook (`stop-wait`) exits 2 to
+# wake the session; a missing-binary bootstrap path exits 0 (swallows it).
 
-# Recursion guard: inside a fork subprocess these vars are set by the forksan
-# runner (open-isolation forks load the plugin). Bail before any binary exec.
-# The Rust entrypoint enforces the same guard as the real defense.
+# Recursion guard, kept as zero-cost defense in depth. Fork subagents emit
+# SubagentStop (not Stop) so they never reach the trigger path; but if these
+# vars were ever present we bail before any binary exec. The Rust entrypoint
+# enforces the same guard as the real defense.
 if [ -n "${FORKSAN_FORK}" ] || [ -n "${FORKSAN_SESSION_ID}" ]; then
     exit 0
 fi

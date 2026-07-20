@@ -4,6 +4,7 @@ use crate::client::Client;
 use forksan_core::config::Paths;
 use forksan_core::project::project_root;
 use forksan_core::protocol::{RequestBody, ResponseBody};
+use forksan_core::wake::{build_wake_payload, DueFork};
 use std::time::Duration;
 
 fn connect(paths: &Paths) -> Result<Client, String> {
@@ -37,12 +38,7 @@ pub fn status(paths: &Paths) -> Result<(), String> {
     };
     let t = now();
     println!("forksan daemon v{} (pid {})", info.version, info.pid);
-    println!(
-        "sessions: {}   running forks: {}   queued reports: {}",
-        info.sessions.len(),
-        info.running.len(),
-        info.queued_reports
-    );
+    println!("sessions: {}", info.sessions.len());
     for s in &info.sessions {
         let tokens = s
             .prompt_tokens
@@ -56,32 +52,15 @@ pub fn status(paths: &Paths) -> Result<(), String> {
             fmt_ago(t, s.last_activity),
         );
     }
-    if !info.running.is_empty() {
-        println!("running:");
-        for r in &info.running {
-            println!(
-                "  {} ({}) started {}",
-                r.fork,
-                r.trigger,
-                fmt_ago(t, r.started_at)
-            );
-        }
-    }
     if !info.recent_runs.is_empty() {
-        println!("recent runs:");
+        println!("recent wakes:");
         for r in &info.recent_runs {
-            let cost = r.cost_usd.map(|c| format!(" ${c:.4}")).unwrap_or_default();
-            let err = r
-                .error
-                .as_deref()
-                .map(|e| format!(" — {e}"))
-                .unwrap_or_default();
             println!(
-                "  {} ({}) [{}]{cost} {}{err}",
+                "  {} ({}) [{}] {}",
                 r.fork,
                 r.trigger,
                 r.state,
-                fmt_ago(t, r.finished_at.unwrap_or(r.started_at)),
+                fmt_ago(t, r.started_at),
             );
         }
     }
@@ -115,7 +94,6 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
             f.description.as_deref().unwrap_or("(no description)")
         );
         let mut details = vec![format!("runs on: {}", f.triggers.join(", "))];
-        details.push(format!("delivery: {}", f.delivery));
         if let Some(t) = f.throttle_secs {
             details.push(format!("throttle: {t}s"));
         }
@@ -125,22 +103,8 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if !f.tags.is_empty() {
             details.push(format!("tags: {}", f.tags.join(", ")));
         }
-        if !f.allowed_tools.is_empty() {
-            // Short lists inline; longer ones summarized to keep the line tidy.
-            if f.allowed_tools.len() <= 3 {
-                details.push(format!("allowed tools: {}", f.allowed_tools.join(", ")));
-            } else {
-                details.push(format!("allowed tools: {} rules", f.allowed_tools.len()));
-            }
-        }
-        if let Some(m) = &f.permission_mode {
-            details.push(format!("permission mode: {m}"));
-        }
         if f.overlap {
             details.push("overlap allowed".into());
-        }
-        if let Some(m) = &f.model {
-            details.push(format!("model: {m}"));
         }
         println!("      {}", details.join(" | "));
         println!("      {}", f.path.display());
@@ -151,45 +115,63 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
     Ok(())
 }
 
-pub fn run_fork(
-    paths: &Paths,
-    name: Option<String>,
-    tag: Option<String>,
-    session: Option<String>,
-) -> Result<(), String> {
+/// Manual runs can no longer spawn anything (forks are subagents of an
+/// interactive session). Instead we print the wake-style spawn instruction to
+/// paste into an interactive Claude Code session.
+pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Result<(), String> {
     if name.is_none() && tag.is_none() {
         return Err("provide a fork name or --tag <tag>".into());
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = project_root(&cwd);
-    let mut client = connect(paths)?;
-    match client
-        .request(RequestBody::RunFork {
-            name,
-            project_root: root,
-            cwd,
-            session_id: session,
-            tag,
+    let user_forks = paths.base.join("forks");
+    let (entries, _) = forksan_core::discovery::discover_forks(&cwd, Some(&user_forks));
+
+    let picked: Vec<_> = match (&name, &tag) {
+        (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
+            Some(e) => vec![e],
+            None => {
+                return Err(format!(
+                    "no fork named '{name}' visible from {}",
+                    cwd.display()
+                ));
+            }
+        },
+        (None, Some(tag)) => {
+            let matched: Vec<_> = entries
+                .into_iter()
+                .filter(|e| e.parsed.def.tags.iter().any(|t| t == tag))
+                .collect();
+            if matched.is_empty() {
+                return Err(format!(
+                    "no forks with tag '{tag}' visible from {}",
+                    cwd.display()
+                ));
+            }
+            matched
+        }
+        (None, None) => unreachable!(),
+    };
+
+    let due: Vec<DueFork> = picked
+        .iter()
+        .map(|e| DueFork {
+            name: e.name.clone(),
+            path: e.path.to_string_lossy().into_owned(),
+            trigger: "manual".to_string(),
+            overlap: e.parsed.def.overlap,
+            after: Vec::new(),
         })
-        .map_err(|e| e.to_string())?
-    {
-        ResponseBody::RunStarted { fork, session_id } => {
-            println!("fork '{fork}' started against session {session_id}");
-            println!("watch it with: forksan status");
-            Ok(())
-        }
-        ResponseBody::RunStartedMany { forks, session_id } => {
-            println!(
-                "started {} fork(s) against session {session_id}: {}",
-                forks.len(),
-                forks.join(", ")
-            );
-            println!("watch them with: forksan status");
-            Ok(())
-        }
-        ResponseBody::Error { message, .. } => Err(message),
-        _ => Err("unexpected response".into()),
-    }
+        .collect();
+    let payload = build_wake_payload("(the current session)", &root.to_string_lossy(), &due);
+
+    println!(
+        "forksan can no longer spawn forks itself — forks run as fork subagents of an\n\
+         interactive session. Paste the following into an interactive Claude Code session\n\
+         to run the selected fork(s) now:\n"
+    );
+    println!("{payload}");
+    Ok(())
 }
 
 pub fn logs(paths: &Paths, follow: bool) -> Result<(), String> {
@@ -221,7 +203,7 @@ pub fn logs(paths: &Paths, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn doctor(paths: &Paths, gc_fork_sessions: Option<String>) -> Result<(), String> {
+pub fn doctor(paths: &Paths) -> Result<(), String> {
     let mut problems = 0;
     let ok = |msg: &str| println!("  ok: {msg}");
     println!("forksan doctor");
@@ -277,34 +259,10 @@ pub fn doctor(paths: &Paths, gc_fork_sessions: Option<String>) -> Result<(), Str
         println!("  note: no state db yet at {}", paths.db().display());
     }
 
-    // The claude binary the forks will run with.
-    let cfg = forksan_core::config::load_config_at(None, &paths.user_config()).0;
-    let found = std::process::Command::new(&cfg.claude_bin)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if found {
-        ok(&format!("claude binary: {}", cfg.claude_bin));
-    } else {
-        problems += 1;
-        println!(
-            "  PROBLEM: cannot run '{} --version' — forks will fail",
-            cfg.claude_bin
-        );
-    }
-
-    // Fork-session transcripts on disk (they accumulate; GC is opt-in).
-    if let Some(ttl) = gc_fork_sessions {
-        let secs = forksan_core::duration::parse_duration_str(&ttl)
-            .ok_or_else(|| format!("invalid age '{ttl}' (try 30d)"))?;
-        gc_transcripts(paths, secs)?;
-    } else {
-        println!("  note: fork runs leave headless session transcripts under ~/.claude/projects/;");
-        println!("        prune old ones with: forksan doctor --gc-fork-sessions 30d");
-    }
+    println!(
+        "  note: v0.5 forks run as fork subagents of your interactive session — no headless\n\
+         \x20       fork subprocesses, and no separate fork-session transcripts to prune."
+    );
 
     if problems == 0 {
         println!("all good");
@@ -312,34 +270,4 @@ pub fn doctor(paths: &Paths, gc_fork_sessions: Option<String>) -> Result<(), Str
     } else {
         Err(format!("{problems} problem(s) found"))
     }
-}
-
-/// Delete transcripts of *our own* fork sessions (ids recorded in fork_runs)
-/// older than `age_secs`. Only exact `<session_id>.jsonl` files under
-/// `~/.claude/projects/` are touched.
-fn gc_transcripts(paths: &Paths, age_secs: u64) -> Result<(), String> {
-    let store = forksan_core::store::Store::open(&paths.db()).map_err(|e| e.to_string())?;
-    let cutoff = now() - age_secs as i64;
-    let ids = store
-        .fork_session_ids_before(cutoff)
-        .map_err(|e| e.to_string())?;
-    if ids.is_empty() {
-        println!("  gc: no fork sessions older than the cutoff");
-        return Ok(());
-    }
-    let home = std::env::var_os("HOME").ok_or("no HOME")?;
-    let projects = std::path::PathBuf::from(home).join(".claude/projects");
-    let mut removed = 0;
-    if let Ok(dirs) = std::fs::read_dir(&projects) {
-        for dir in dirs.flatten() {
-            for id in &ids {
-                let candidate = dir.path().join(format!("{id}.jsonl"));
-                if candidate.is_file() && std::fs::remove_file(&candidate).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-    }
-    println!("  gc: removed {removed} fork-session transcript(s)");
-    Ok(())
 }

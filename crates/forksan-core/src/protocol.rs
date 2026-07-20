@@ -21,33 +21,19 @@ pub struct Request {
 pub enum RequestBody {
     /// Version handshake.
     Hello { version: String },
-    /// A Claude Code lifecycle event, forwarded from a hook.
+    /// A fast Claude Code lifecycle event (SessionStart / PromptSubmit /
+    /// SessionEnd), forwarded from a hook. Acked immediately.
     Event(Event),
-    /// Fetch pending fork reports for delivery as additionalContext.
-    PollReports {
-        session_id: String,
-        project_root: PathBuf,
-        budget_chars: usize,
-    },
-    /// Manually fire forks (the `forksan run` command): one by `name`, or
-    /// every fork carrying `tag`. Exactly one of the two is set.
-    RunFork {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        project_root: PathBuf,
-        cwd: PathBuf,
-        /// Target session; defaults to the project's most recent open one.
-        session_id: Option<String>,
-        /// Run every fork whose `tags` contain this tag (instead of `name`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tag: Option<String>,
-    },
+    /// The asyncRewake Stop hook's long poll: register activity, arm idle
+    /// timers, then block until forks are due (a `Wake`) or the wait is
+    /// cancelled/the daemon retires (a `Waited`).
+    StopWait(Event),
     /// Daemon + session + run status (the `forksan status` command).
     Status,
-    /// Discovered forks for a project (the `forksan forks list` command).
+    /// Discovered forks for a project (the `forksan forks` command).
     ListForks { project_root: PathBuf, cwd: PathBuf },
-    /// Ask the daemon to exit. With `drain`, it finishes in-flight fork runs
-    /// first. Frozen shape — never change.
+    /// Ask the daemon to exit. With `drain`, it finishes cleanly first.
+    /// Frozen shape — never change.
     Shutdown { drain: bool },
 }
 
@@ -62,14 +48,7 @@ pub struct Event {
     /// SessionStart source (`startup`/`resume`/`clear`/`compact`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// PreCompact trigger (`manual`/`auto`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<String>,
-    /// SessionEnd reason (`clear`/`logout`/`prompt_input_exit`/`other`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// The session's model id (SessionStart provides it), for per-model
-    /// context-window lookup.
+    /// The session's model id (SessionStart provides it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Per-session enable (whitelist) tag filter, from `FORKSAN_ENABLE_TAGS`.
@@ -78,9 +57,6 @@ pub struct Event {
     /// Per-session disable (blocklist) tag filter, from `FORKSAN_DISABLE_TAGS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_tags: Option<Vec<String>>,
-    /// What the hook wants to wait for before the daemon acks.
-    #[serde(default)]
-    pub wait: WaitMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,20 +64,10 @@ pub struct Event {
 pub enum EventKind {
     SessionStart,
     PromptSubmit,
+    /// The end of a turn — carried by a `StopWait` request (the asyncRewake
+    /// Stop hook), never by a plain `Event`.
     Stop,
-    PreCompact,
     SessionEnd,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitMode {
-    /// Ack as soon as the event is recorded.
-    #[default]
-    None,
-    /// Ack once every matching fork's subprocess has been spawned (used by
-    /// PreCompact so forks snapshot pre-compaction context).
-    ForksSpawned,
 }
 
 /// A response frame.
@@ -120,21 +86,17 @@ pub enum ResponseBody {
     HelloInfo {
         version: String,
     },
-    Reports {
-        items: Vec<ReportItem>,
+    /// Forks are due: the hook prints `payload` to stderr and exits 2 to wake
+    /// the session.
+    Wake {
+        payload: String,
     },
+    /// The stop-wait resolved without a wake (cancelled by activity, nothing
+    /// due, or the daemon is retiring): the hook exits 0 silently.
+    Waited,
     StatusInfo(StatusInfo),
     ForkList {
         items: Vec<ForkInfo>,
-    },
-    RunStarted {
-        fork: String,
-        session_id: String,
-    },
-    /// One or more forks started by a `forksan run --tag` bulk run.
-    RunStartedMany {
-        forks: Vec<String>,
-        session_id: String,
     },
     Error {
         code: ErrorCode,
@@ -151,24 +113,6 @@ pub enum ErrorCode {
     Internal,
 }
 
-/// One queued fork report ready for injection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReportItem {
-    pub fork: String,
-    pub trigger: String,
-    pub kind: ReportKind,
-    pub body: String,
-    /// Unix epoch seconds.
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportKind {
-    Started,
-    Response,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusInfo {
     pub version: String,
@@ -177,9 +121,8 @@ pub struct StatusInfo {
     pub daemon_proto: u32,
     pub pid: u32,
     pub sessions: Vec<SessionInfo>,
-    pub running: Vec<RunInfo>,
+    /// Recent wakes issued (forks handed to sessions to spawn).
     pub recent_runs: Vec<RunInfo>,
-    pub queued_reports: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,9 +143,6 @@ pub struct RunInfo {
     pub state: String,
     /// Unix epoch seconds.
     pub started_at: i64,
-    pub finished_at: Option<i64>,
-    pub cost_usd: Option<f64>,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,19 +151,13 @@ pub struct ForkInfo {
     pub path: PathBuf,
     pub description: Option<String>,
     pub triggers: Vec<String>,
-    pub delivery: String,
     pub throttle_secs: Option<u64>,
     #[serde(default)]
     pub after: Vec<String>,
     #[serde(default)]
     pub overlap: bool,
-    pub model: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-    #[serde(default)]
-    pub permission_mode: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -239,23 +173,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_event() {
+    fn round_trip_stop_wait() {
         let req = Request {
             proto: crate::PROTO_VERSION,
             id: 7,
-            body: RequestBody::Event(Event {
-                event: EventKind::PreCompact,
+            body: RequestBody::StopWait(Event {
+                event: EventKind::Stop,
                 session_id: "abc".into(),
                 transcript_path: Some("/t.jsonl".into()),
                 cwd: "/p".into(),
                 project_root: "/p".into(),
                 source: None,
-                trigger: Some("auto".into()),
-                reason: None,
                 model: None,
                 enable_tags: None,
                 disable_tags: None,
-                wait: WaitMode::ForksSpawned,
             }),
         };
         let line = encode(&req).unwrap();
@@ -263,10 +194,24 @@ mod tests {
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back.id, 7);
         match back.body {
-            RequestBody::Event(e) => {
-                assert_eq!(e.event, EventKind::PreCompact);
-                assert_eq!(e.wait, WaitMode::ForksSpawned);
-            }
+            RequestBody::StopWait(e) => assert_eq!(e.event, EventKind::Stop),
+            _ => panic!("wrong body"),
+        }
+    }
+
+    #[test]
+    fn wake_response_round_trips() {
+        let resp = Response {
+            proto: crate::PROTO_VERSION,
+            id: 1,
+            body: ResponseBody::Wake {
+                payload: "hello".into(),
+            },
+        };
+        let line = encode(&resp).unwrap();
+        let back: Response = serde_json::from_str(line.trim()).unwrap();
+        match back.body {
+            ResponseBody::Wake { payload } => assert_eq!(payload, "hello"),
             _ => panic!("wrong body"),
         }
     }

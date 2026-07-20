@@ -32,17 +32,15 @@ enum Command {
         #[arg(long)]
         project: Option<std::path::PathBuf>,
     },
-    /// Manually fire forks against the project's current session: one by
-    /// name, or every fork carrying `--tag`.
+    /// Print the spawn instruction for a fork (by name, or every fork carrying
+    /// `--tag`) to paste into an interactive Claude Code session. v0.5 forks
+    /// run as fork subagents, so forksan can no longer spawn them itself.
     Run {
         /// Fork name (omit when using --tag).
         name: Option<String>,
-        /// Run every fork carrying this tag instead of one by name.
+        /// Select every fork carrying this tag instead of one by name.
         #[arg(long, conflicts_with = "name")]
         tag: Option<String>,
-        /// Target session id (defaults to the project's most recent open one).
-        #[arg(long)]
-        session: Option<String>,
     },
     /// Show the daemon log.
     Logs {
@@ -51,12 +49,7 @@ enum Command {
         follow: bool,
     },
     /// Check the installation and report problems.
-    Doctor {
-        /// Also delete our fork-session transcripts older than this age
-        /// (e.g. 30d).
-        #[arg(long, value_name = "AGE")]
-        gc_fork_sessions: Option<String>,
-    },
+    Doctor,
     /// Ask the daemon to exit (it restarts on the next hook event).
     StopDaemon {
         /// Wait for in-flight fork runs to finish first.
@@ -76,13 +69,9 @@ fn main() {
         Command::Hook { event } => hook::run_hook(event),
         Command::Status => exit_on_err(commands::status(&paths)),
         Command::Forks { project } => exit_on_err(commands::list_forks(&paths, project)),
-        Command::Run { name, tag, session } => {
-            exit_on_err(commands::run_fork(&paths, name, tag, session))
-        }
+        Command::Run { name, tag } => exit_on_err(commands::run_fork(&paths, name, tag)),
         Command::Logs { follow } => exit_on_err(commands::logs(&paths, follow)),
-        Command::Doctor { gc_fork_sessions } => {
-            exit_on_err(commands::doctor(&paths, gc_fork_sessions))
-        }
+        Command::Doctor => exit_on_err(commands::doctor(&paths)),
         Command::StopDaemon { drain } => exit_on_err(stop_daemon(&paths, drain)),
     }
 }

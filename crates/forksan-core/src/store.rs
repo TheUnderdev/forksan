@@ -5,20 +5,20 @@
 //!   on session close.
 //! - fires latch: context triggers fire at most once per (session, fork,
 //!   trigger label).
-//! - `forks_ran_at` vs `last_activity` decides the boot sweep's owed forks.
-//! - reports: delivered to the origin session while it lives; to any session
-//!   in the same project once the origin is closed.
+//! - runs: since v0.5 a "run" is a wake issued to a session (state `issued`),
+//!   recorded so per-tag throttles can find the last wake per tag. The daemon
+//!   no longer observes fork completion.
+//!
+//! The schema is unchanged from v0.4 (v3): the `reports` table still exists
+//! but is no longer written or read (report delivery is native in v0.5).
 
-use crate::protocol::{ReportItem, ReportKind};
-use crate::{truncate_chars, REPORT_MAX_CHARS};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: i32 = 3;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
-/// dropped). `NULL` (unset) stays `None`; a stored value always yields a
-/// (possibly empty) list.
+/// dropped). `NULL` (unset) stays `None`.
 fn split_tags(s: Option<String>) -> Option<Vec<String>> {
     s.map(|s| {
         s.split(',')
@@ -37,7 +37,6 @@ pub struct SessionRow {
     pub transcript_path: Option<PathBuf>,
     pub status: SessionStatus,
     pub last_activity: i64,
-    pub forks_ran_at: Option<i64>,
     pub transcript_offset: u64,
     pub prompt_tokens: Option<u64>,
     pub model: Option<String>,
@@ -72,7 +71,7 @@ pub struct RosterEntry {
     pub ran_at: Option<i64>,
 }
 
-/// The terminal state of a fork run.
+/// A recorded wake (state `issued`).
 #[derive(Debug, Clone)]
 pub struct RunRow {
     pub id: i64,
@@ -81,10 +80,6 @@ pub struct RunRow {
     pub trigger_label: String,
     pub state: String,
     pub started_at: i64,
-    pub finished_at: Option<i64>,
-    pub fork_session_id: Option<String>,
-    pub cost_usd: Option<f64>,
-    pub error: Option<String>,
 }
 
 pub struct Store {
@@ -174,8 +169,6 @@ impl Store {
             )?;
         }
         if version < 2 {
-            // Per-session tag filter (comma-joined; NULL = unset). Added by
-            // ALTER so both fresh (post-v1 CREATE) and upgraded DBs converge.
             conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN enable_tags TEXT;
@@ -184,8 +177,6 @@ impl Store {
             )?;
         }
         if version < 3 {
-            // A run records the tags of the fork it ran (comma-joined; NULL =
-            // untagged) so per-tag throttles can find the last run per tag.
             conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE fork_runs ADD COLUMN tags TEXT;
@@ -212,14 +203,10 @@ impl Store {
         now: i64,
     ) -> rusqlite::Result<()> {
         // `cwd` is pinned to the first event's value (first write wins): a
-        // Claude Code session's cwd drifts as its Bash tool `cd`s around, but
-        // `--resume` only finds the conversation under the *launch*
-        // directory's project folder, so the fork must run there. Each
-        // resumed leg is a new session id whose first event carries its own
-        // launch cwd, making per-leg pinning exactly right. `transcript_path`
-        // does not drift, so COALESCE is fine there. The per-session tag
-        // filter always reflects the latest event (the hook re-sends it on
-        // every frame), so it overwrites — a cleared env var (NULL) clears it.
+        // session's cwd drifts as its Bash tool `cd`s around, but the launch
+        // directory is the stable per-session identity. `transcript_path` does
+        // not drift, so COALESCE is fine. The per-session tag filter always
+        // reflects the latest event, so it overwrites (a cleared env clears it).
         self.conn.execute(
             "INSERT INTO sessions (session_id, project_root, cwd, transcript_path, status,
                                    last_activity, created_at, model, enable_tags, disable_tags)
@@ -250,7 +237,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
+                        transcript_offset, prompt_tokens, model, created_at,
                         enable_tags, disable_tags
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
@@ -271,20 +258,19 @@ impl Store {
                 SessionStatus::Closed
             },
             last_activity: row.get(5)?,
-            forks_ran_at: row.get(6)?,
-            transcript_offset: row.get::<_, i64>(7)? as u64,
-            prompt_tokens: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
-            model: row.get(9)?,
-            created_at: row.get(10)?,
-            enable_tags: split_tags(row.get::<_, Option<String>>(11)?),
-            disable_tags: split_tags(row.get::<_, Option<String>>(12)?),
+            transcript_offset: row.get::<_, i64>(6)? as u64,
+            prompt_tokens: row.get::<_, Option<i64>>(7)?.map(|n| n as u64),
+            model: row.get(8)?,
+            created_at: row.get(9)?,
+            enable_tags: split_tags(row.get::<_, Option<String>>(10)?),
+            disable_tags: split_tags(row.get::<_, Option<String>>(11)?),
         })
     }
 
     pub fn list_open_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                    forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
+                    transcript_offset, prompt_tokens, model, created_at,
                     enable_tags, disable_tags
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
@@ -292,35 +278,9 @@ impl Store {
         rows.collect()
     }
 
-    /// The most recently active open session in a project.
-    pub fn most_recent_open_session(
-        &self,
-        project_root: &Path,
-    ) -> rusqlite::Result<Option<SessionRow>> {
-        self.conn
-            .query_row(
-                "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
-                        enable_tags, disable_tags
-                 FROM sessions WHERE status = 'open' AND project_root = ?1
-                 ORDER BY last_activity DESC LIMIT 1",
-                params![project_root.to_string_lossy()],
-                Self::row_to_session,
-            )
-            .optional()
-    }
-
     pub fn set_last_activity(&self, session_id: &str, now: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE sessions SET last_activity = ?2 WHERE session_id = ?1",
-            params![session_id, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_forks_ran_at(&self, session_id: &str, now: i64) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET forks_ran_at = ?2 WHERE session_id = ?1",
             params![session_id, now],
         )?;
         Ok(())
@@ -394,7 +354,8 @@ impl Store {
         rows.collect()
     }
 
-    /// Record that a rostered fork ran (throttle bookkeeping; never dequeues).
+    /// Record that a rostered fork was woken (per-fork throttle bookkeeping;
+    /// never dequeues).
     pub fn touch_fork_ran(
         &self,
         session_id: &str,
@@ -409,6 +370,23 @@ impl Store {
     }
 
     // ---- fires latch ----
+
+    /// Whether a once-per-session trigger is already latched (read-only, used
+    /// during selection so evaluation stays side-effect-free until issuance).
+    pub fn is_latched(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        trigger_label: &str,
+    ) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_fires
+             WHERE session_id = ?1 AND fork_name = ?2 AND trigger_label = ?3",
+            params![session_id, fork_name, trigger_label],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
 
     /// Latch a once-per-session trigger. Returns true if newly latched
     /// (i.e. the caller should fire).
@@ -427,9 +405,12 @@ impl Store {
         Ok(n > 0)
     }
 
-    // ---- runs ----
+    // ---- runs (issued wakes) ----
 
-    pub fn insert_run(
+    /// Record that a wake was issued for a fork (state `issued`). `tags` is the
+    /// fork's comma-joined tags (NULL when untagged) so per-tag throttles can
+    /// find the last wake per tag.
+    pub fn record_issued_run(
         &self,
         session_id: &str,
         fork_name: &str,
@@ -438,15 +419,16 @@ impl Store {
         now: i64,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO fork_runs (session_id, fork_name, trigger_label, state, started_at, tags)
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            "INSERT INTO fork_runs (session_id, fork_name, trigger_label, state, started_at,
+                                    finished_at, tags)
+             VALUES (?1, ?2, ?3, 'issued', ?4, ?4, ?5)",
             params![session_id, fork_name, trigger_label, now, tags],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// The most recent run start (across the project) of any fork carrying
-    /// one of `tags`, for per-tag throttling. `None` when no such run exists.
+    /// The most recent issued wake (across the project) of any fork carrying
+    /// one of `tags`, for per-tag throttling. `None` when none exists.
     pub fn last_run_for_tags(
         &self,
         project_root: &Path,
@@ -462,7 +444,6 @@ impl Store {
              ORDER BY r.started_at DESC",
         )?;
         let mut rows = stmt.query(params![project_root.to_string_lossy()])?;
-        // Rows are newest-first, so the first tag match is the latest run.
         while let Some(row) = rows.next()? {
             let started_at: i64 = row.get(0)?;
             let row_tags: String = row.get(1)?;
@@ -478,38 +459,10 @@ impl Store {
         Ok(None)
     }
 
-    pub fn finish_run(
-        &self,
-        run_id: i64,
-        state: &str,
-        fork_session_id: Option<&str>,
-        cost_usd: Option<f64>,
-        error: Option<&str>,
-        now: i64,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE fork_runs SET state = ?2, finished_at = ?3, fork_session_id = ?4,
-                                  cost_usd = ?5, error = ?6
-             WHERE id = ?1",
-            params![run_id, state, now, fork_session_id, cost_usd, error],
-        )?;
-        Ok(())
-    }
-
-    /// Mark runs left 'running' by a dead daemon as interrupted.
-    pub fn mark_stale_runs_interrupted(&self, now: i64) -> rusqlite::Result<usize> {
-        self.conn.execute(
-            "UPDATE fork_runs SET state = 'interrupted', finished_at = ?1
-             WHERE state = 'running'",
-            params![now],
-        )
-    }
-
     pub fn list_runs(&self, states: &[&str], limit: usize) -> rusqlite::Result<Vec<RunRow>> {
         let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, session_id, fork_name, trigger_label, state, started_at, finished_at,
-                    fork_session_id, cost_usd, error
+            "SELECT id, session_id, fork_name, trigger_label, state, started_at
              FROM fork_runs WHERE state IN ({placeholders})
              ORDER BY started_at DESC, id DESC LIMIT {limit}"
         );
@@ -522,167 +475,9 @@ impl Store {
                 trigger_label: row.get(3)?,
                 state: row.get(4)?,
                 started_at: row.get(5)?,
-                finished_at: row.get(6)?,
-                fork_session_id: row.get(7)?,
-                cost_usd: row.get(8)?,
-                error: row.get(9)?,
             })
         })?;
         rows.collect()
-    }
-
-    /// Session ids of fork runs older than `cutoff` (the GC candidates).
-    pub fn fork_session_ids_before(&self, cutoff: i64) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT fork_session_id FROM fork_runs
-             WHERE fork_session_id IS NOT NULL AND started_at < ?1",
-        )?;
-        let rows = stmt.query_map(params![cutoff], |row| row.get(0))?;
-        rows.collect()
-    }
-
-    // ---- reports ----
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_report(
-        &self,
-        run_id: Option<i64>,
-        origin_session_id: &str,
-        project_root: &Path,
-        fork_name: &str,
-        trigger_label: &str,
-        kind: ReportKind,
-        body: &str,
-        now: i64,
-    ) -> rusqlite::Result<()> {
-        let kind = match kind {
-            ReportKind::Started => "started",
-            ReportKind::Response => "response",
-        };
-        self.conn.execute(
-            "INSERT INTO reports (run_id, origin_session_id, project_root, fork_name,
-                                  trigger_label, kind, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                run_id,
-                origin_session_id,
-                project_root.to_string_lossy(),
-                fork_name,
-                trigger_label,
-                kind,
-                truncate_chars(body, REPORT_MAX_CHARS),
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Fetch pending reports for a session and mark them delivered, in one
-    /// transaction. Eligible: reports from this session, plus reports from
-    /// closed sessions in the same project. A `started` marker whose run
-    /// already has a pending `response` is collapsed (skipped and marked
-    /// delivered). Items past `budget_chars` stay queued for the next poll.
-    pub fn poll_reports(
-        &self,
-        session_id: &str,
-        project_root: &Path,
-        budget_chars: usize,
-        now: i64,
-    ) -> rusqlite::Result<Vec<ReportItem>> {
-        type Candidate = (i64, Option<i64>, String, String, String, String, i64);
-        let tx = self.conn.unchecked_transaction()?;
-        let candidates: Vec<Candidate> = {
-            let mut stmt = tx.prepare(
-                "SELECT r.id, r.run_id, r.fork_name, r.trigger_label, r.kind, r.body, r.created_at
-                 FROM reports r
-                 WHERE r.delivered_at IS NULL
-                   AND (r.origin_session_id = ?1
-                        OR (r.project_root = ?2
-                            AND NOT EXISTS (SELECT 1 FROM sessions s
-                                            WHERE s.session_id = r.origin_session_id
-                                              AND s.status = 'open')))
-                 ORDER BY r.created_at, r.id",
-            )?;
-            let rows =
-                stmt.query_map(params![session_id, project_root.to_string_lossy()], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                })?;
-            rows.collect::<Result<_, _>>()?
-        };
-
-        // Runs with a pending response: their started markers collapse.
-        let responded: std::collections::HashSet<i64> = candidates
-            .iter()
-            .filter(|(_, run_id, _, _, kind, _, _)| kind == "response" && run_id.is_some())
-            .map(|(_, run_id, _, _, _, _, _)| run_id.unwrap())
-            .collect();
-
-        let mut items = Vec::new();
-        let mut delivered_ids = Vec::new();
-        let mut used = 0usize;
-        for (id, run_id, fork, trigger, kind, body, created_at) in candidates {
-            let collapse = kind == "started" && run_id.is_some_and(|r| responded.contains(&r));
-            if collapse {
-                delivered_ids.push(id);
-                continue;
-            }
-            let cost = body.chars().count();
-            if !items.is_empty() && used + cost > budget_chars {
-                break;
-            }
-            used += cost;
-            delivered_ids.push(id);
-            items.push(ReportItem {
-                fork,
-                trigger,
-                kind: if kind == "started" {
-                    ReportKind::Started
-                } else {
-                    ReportKind::Response
-                },
-                body,
-                created_at,
-            });
-        }
-
-        for id in &delivered_ids {
-            tx.execute(
-                "UPDATE reports SET delivered_at = ?2, delivered_to_session = ?3 WHERE id = ?1",
-                params![id, now, session_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(items)
-    }
-
-    pub fn count_pending_reports(&self) -> rusqlite::Result<u64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM reports WHERE delivered_at IS NULL",
-            [],
-            |r| r.get::<_, i64>(0).map(|n| n as u64),
-        )
-    }
-
-    /// Drop expired reports: undelivered past `undelivered_ttl_secs`,
-    /// delivered past 48h.
-    pub fn expire_reports(&self, now: i64, undelivered_ttl_secs: u64) -> rusqlite::Result<usize> {
-        let n1 = self.conn.execute(
-            "DELETE FROM reports WHERE delivered_at IS NULL AND created_at < ?1",
-            params![now - undelivered_ttl_secs as i64],
-        )?;
-        let n2 = self.conn.execute(
-            "DELETE FROM reports WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
-            params![now - 48 * 3600],
-        )?;
-        Ok(n1 + n2)
     }
 }
 
@@ -715,11 +510,9 @@ mod tests {
         assert!(s.queue_fork("a", "j", Path::new("/p/j.md"), 100).unwrap());
         assert!(!s.queue_fork("a", "j", Path::new("/p/j.md"), 101).unwrap());
         assert!(s.queue_fork("a", "k", Path::new("/p/k.md"), 102).unwrap());
-        // Per-session isolation.
         seed_session(&s, "b", "/p", 100);
         assert!(s.queue_fork("b", "j", Path::new("/p/j.md"), 100).unwrap());
 
-        // Running never dequeues.
         s.touch_fork_ran("a", "j", 200).unwrap();
         let roster = s.roster("a").unwrap();
         assert_eq!(roster.len(), 2);
@@ -727,7 +520,6 @@ mod tests {
         assert_eq!(roster[0].ran_at, Some(200));
         assert_eq!(roster[1].ran_at, None);
 
-        // Close clears roster + latches, and re-queue works after reopen.
         assert!(s.try_latch_fire("a", "j", "context_tokens:5", 200).unwrap());
         s.close_session("a").unwrap();
         assert!(s.roster("a").unwrap().is_empty());
@@ -753,222 +545,61 @@ mod tests {
     }
 
     #[test]
-    fn report_delivery_scoping() {
+    fn issued_runs_and_listing() {
         let s = store();
-        seed_session(&s, "live", "/p", 100);
-        seed_session(&s, "dead", "/p", 100);
-        seed_session(&s, "other-proj", "/q", 100);
-
-        s.insert_report(
-            None,
-            "live",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            "own",
-            110,
-        )
-        .unwrap();
-        s.insert_report(
-            None,
-            "dead",
-            Path::new("/p"),
-            "g",
-            "idle",
-            ReportKind::Response,
-            "dead-own",
-            111,
-        )
-        .unwrap();
-        s.insert_report(
-            None,
-            "other-proj",
-            Path::new("/q"),
-            "h",
-            "idle",
-            ReportKind::Response,
-            "q",
-            112,
-        )
-        .unwrap();
-
-        // While 'dead' is open, 'live' only sees its own.
-        let items = s
-            .poll_reports("live", Path::new("/p"), 100_000, 200)
+        seed_session(&s, "a", "/p", 100);
+        s.record_issued_run("a", "f", "idle", Some("ci"), 100)
             .unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].body, "own");
-
-        // Once 'dead' closes, its report flows to 'live' too.
-        s.close_session("dead").unwrap();
-        let items = s
-            .poll_reports("live", Path::new("/p"), 100_000, 201)
-            .unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].body, "dead-own");
-
-        // Nothing left; /q report untouched.
-        assert!(s
-            .poll_reports("live", Path::new("/p"), 100_000, 202)
-            .unwrap()
-            .is_empty());
-        assert_eq!(s.count_pending_reports().unwrap(), 1);
+        let runs = s.list_runs(&["issued"], 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].fork_name, "f");
+        assert_eq!(runs[0].state, "issued");
     }
 
     #[test]
-    fn started_collapses_when_response_pending() {
+    fn last_run_for_tags_finds_latest_across_project() {
         let s = store();
         seed_session(&s, "a", "/p", 100);
-        let run = s.insert_run("a", "f", "idle", None, 100).unwrap();
-        s.insert_report(
-            Some(run),
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Started,
-            "started f",
-            100,
-        )
-        .unwrap();
-        // Another run still in flight: its started marker must survive.
-        let run2 = s.insert_run("a", "g", "idle", None, 100).unwrap();
-        s.insert_report(
-            Some(run2),
-            "a",
-            Path::new("/p"),
-            "g",
-            "idle",
-            ReportKind::Started,
-            "started g",
-            101,
-        )
-        .unwrap();
-        s.insert_report(
-            Some(run),
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            "done f",
-            105,
-        )
-        .unwrap();
+        seed_session(&s, "b", "/q", 100);
 
-        let items = s.poll_reports("a", Path::new("/p"), 100_000, 200).unwrap();
-        let kinds: Vec<(String, ReportKind)> =
-            items.iter().map(|i| (i.fork.clone(), i.kind)).collect();
         assert_eq!(
-            kinds,
-            vec![
-                ("g".to_string(), ReportKind::Started),
-                ("f".to_string(), ReportKind::Response)
-            ]
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
+                .unwrap(),
+            None
         );
-        // Collapsed marker is gone for good.
-        assert!(s
-            .poll_reports("a", Path::new("/p"), 100_000, 201)
-            .unwrap()
-            .is_empty());
-    }
 
-    #[test]
-    fn budget_cutoff_keeps_remainder_queued() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        for i in 0..3 {
-            s.insert_report(
-                None,
-                "a",
-                Path::new("/p"),
-                "f",
-                "idle",
-                ReportKind::Response,
-                &"x".repeat(1000),
-                100 + i,
-            )
+        s.record_issued_run("a", "f", "manual", Some("ci,build"), 110)
             .unwrap();
-        }
-        let items = s.poll_reports("a", Path::new("/p"), 2500, 200).unwrap();
-        assert_eq!(items.len(), 2);
-        let items = s.poll_reports("a", Path::new("/p"), 2500, 201).unwrap();
-        assert_eq!(items.len(), 1);
-        // A single oversized item still delivers (never wedges).
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            &"y".repeat(5000),
-            300,
-        )
-        .unwrap();
-        let items = s.poll_reports("a", Path::new("/p"), 100, 400).unwrap();
-        assert_eq!(items.len(), 1);
-    }
-
-    #[test]
-    fn report_body_capped_and_ttl() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            &"z".repeat(REPORT_MAX_CHARS + 500),
-            100,
-        )
-        .unwrap();
-        let items = s
-            .poll_reports("a", Path::new("/p"), usize::MAX, 200)
+        s.record_issued_run("a", "g", "manual", Some("review"), 120)
             .unwrap();
-        assert!(items[0].body.ends_with("…(truncated)"));
-        assert!(items[0].body.chars().count() <= REPORT_MAX_CHARS + 20);
+        s.record_issued_run("a", "h", "manual", None, 130).unwrap();
 
-        // TTL: undelivered dropped after ttl, delivered after 48h.
-        s.insert_report(
-            None,
-            "a",
-            Path::new("/p"),
-            "f",
-            "idle",
-            ReportKind::Response,
-            "old",
-            100,
-        )
-        .unwrap();
-        let dropped = s.expire_reports(100 + 7 * 86400 + 1, 7 * 86400).unwrap();
-        assert_eq!(dropped, 2); // the old undelivered + the delivered one past 48h
-        assert_eq!(s.count_pending_reports().unwrap(), 0);
-    }
-
-    #[test]
-    fn runs_lifecycle_and_stale_marking() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        let id = s.insert_run("a", "f", "idle", None, 100).unwrap();
-        assert_eq!(s.list_runs(&["running"], 10).unwrap().len(), 1);
-        s.finish_run(id, "done", Some("fork-sid"), Some(0.01), None, 150)
-            .unwrap();
-        assert!(s.list_runs(&["running"], 10).unwrap().is_empty());
-        let done = s.list_runs(&["done"], 10).unwrap();
-        assert_eq!(done[0].fork_session_id.as_deref(), Some("fork-sid"));
-
-        let id2 = s.insert_run("a", "g", "idle", None, 160).unwrap();
-        let _ = id2;
-        assert_eq!(s.mark_stale_runs_interrupted(200).unwrap(), 1);
-        assert_eq!(s.list_runs(&["interrupted"], 10).unwrap().len(), 1);
         assert_eq!(
-            s.fork_session_ids_before(1000).unwrap(),
-            vec!["fork-sid".to_string()]
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
+                .unwrap(),
+            Some(110)
         );
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["build".to_string()])
+                .unwrap(),
+            Some(110)
+        );
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["bui".to_string()])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/p"), &["ci".to_string(), "review".to_string()])
+                .unwrap(),
+            Some(120)
+        );
+        assert_eq!(
+            s.last_run_for_tags(Path::new("/q"), &["ci".to_string()])
+                .unwrap(),
+            None
+        );
+        assert_eq!(s.last_run_for_tags(Path::new("/p"), &[]).unwrap(), None);
     }
 
     #[test]
@@ -992,7 +623,6 @@ mod tests {
         );
         assert_eq!(row.disable_tags, Some(vec!["noisy".to_string()]));
 
-        // A later event with no filter clears both (env unset => NULL).
         s.upsert_session(
             "a",
             Path::new("/p"),
@@ -1012,7 +642,6 @@ mod tests {
     #[test]
     fn cwd_is_pinned_to_first_event() {
         let s = store();
-        // First event: launch directory /home/proj.
         s.upsert_session(
             "a",
             Path::new("/home/proj"),
@@ -1024,7 +653,6 @@ mod tests {
             100,
         )
         .unwrap();
-        // A later event after the session `cd`'d elsewhere.
         s.upsert_session(
             "a",
             Path::new("/home/proj"),
@@ -1037,84 +665,7 @@ mod tests {
         )
         .unwrap();
         let row = s.get_session("a").unwrap().unwrap();
-        // cwd stays the launch dir; last_activity still advances.
         assert_eq!(row.cwd, PathBuf::from("/home/proj"));
         assert_eq!(row.last_activity, 200);
-    }
-
-    #[test]
-    fn last_run_for_tags_finds_latest_across_project() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        seed_session(&s, "b", "/q", 100);
-
-        // No tagged runs yet.
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
-                .unwrap(),
-            None
-        );
-
-        // A ci run in project /p at t=110, then a review run at t=120.
-        s.insert_run("a", "f", "manual", Some("ci,build"), 110)
-            .unwrap();
-        s.insert_run("a", "g", "manual", Some("review"), 120)
-            .unwrap();
-        // Untagged runs never count.
-        s.insert_run("a", "h", "manual", None, 130).unwrap();
-
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/p"), &["ci".to_string()])
-                .unwrap(),
-            Some(110)
-        );
-        // Comma-boundary matching: "build" hits, "bui" must not.
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/p"), &["build".to_string()])
-                .unwrap(),
-            Some(110)
-        );
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/p"), &["bui".to_string()])
-                .unwrap(),
-            None
-        );
-        // Multiple tags: the newest matching run wins.
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/p"), &["ci".to_string(), "review".to_string()])
-                .unwrap(),
-            Some(120)
-        );
-        // Project scoping: /q sees nothing.
-        assert_eq!(
-            s.last_run_for_tags(Path::new("/q"), &["ci".to_string()])
-                .unwrap(),
-            None
-        );
-        // Empty tag list is a no-op.
-        assert_eq!(s.last_run_for_tags(Path::new("/p"), &[]).unwrap(), None);
-    }
-
-    #[test]
-    fn most_recent_open_session_per_project() {
-        let s = store();
-        seed_session(&s, "a", "/p", 100);
-        seed_session(&s, "b", "/p", 200);
-        seed_session(&s, "c", "/q", 300);
-        assert_eq!(
-            s.most_recent_open_session(Path::new("/p"))
-                .unwrap()
-                .unwrap()
-                .session_id,
-            "b"
-        );
-        s.close_session("b").unwrap();
-        assert_eq!(
-            s.most_recent_open_session(Path::new("/p"))
-                .unwrap()
-                .unwrap()
-                .session_id,
-            "a"
-        );
     }
 }

@@ -9,7 +9,7 @@
 //! roots define the same name, the first-discovered wins (roots are scanned
 //! nearest-project-first, so project forks override user-level ones).
 
-use crate::frontmatter::{parse_fork_file, ParsedFork};
+use crate::frontmatter::{parse_fork_file, ForkParse, ParsedFork};
 use std::path::{Path, PathBuf};
 
 /// Cap on organizational-subfolder nesting below a forks root.
@@ -67,6 +67,38 @@ fn insert_entry(
     path: PathBuf,
     root: &Path,
 ) {
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(format!("failed to read {}: {e}", path.display()));
+            return;
+        }
+    };
+    let parsed = match parse_fork_file(&name, &content) {
+        ForkParse::Fork(p) => p,
+        // A companion note that only looks like a fork: warn so a missing
+        // `fork: true` marker can't silently disable a real fork.
+        ForkParse::NotFork { fork_like: true } => {
+            warnings.push(format!(
+                "{} has fork-like frontmatter but no `fork: true` — not treated as a fork",
+                path.display()
+            ));
+            return;
+        }
+        // A plain companion `.md` (or explicit `fork: false`): silently skip.
+        ForkParse::NotFork { fork_like: false } => {
+            tracing::debug!(path = %path.display(), "not a fork (no `fork: true`), skipping");
+            return;
+        }
+        ForkParse::Invalid => {
+            warnings.push(format!(
+                "fork '{name}' at {} has invalid frontmatter YAML, skipped",
+                path.display()
+            ));
+            return;
+        }
+    };
+    // Only real forks reserve a name / shadow others.
     if let Some(existing) = entries.iter().find(|e| e.name == name) {
         if existing.path != path {
             warnings.push(format!(
@@ -77,20 +109,6 @@ fn insert_entry(
         }
         return;
     }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            warnings.push(format!("failed to read {}: {e}", path.display()));
-            return;
-        }
-    };
-    let Some(parsed) = parse_fork_file(&name, &content) else {
-        warnings.push(format!(
-            "fork '{name}' at {} has invalid frontmatter YAML, skipped",
-            path.display()
-        ));
-        return;
-    };
     entries.push(ForkEntry {
         name,
         path,
@@ -153,15 +171,16 @@ mod tests {
         let root = tmp.path().join("proj");
         write(
             &root.join(".forksan/forks/journal.md"),
-            "---\ndescription: j\n---\nbody",
+            "---\nfork: true\ndescription: j\n---\nbody",
         );
         write(
             &root.join(".forksan/forks/cleanup/FORK.md"),
-            "---\nrun_on: [boot]\n---\nbody",
+            "---\nfork: true\nrun_on: [idle]\n---\nbody",
         );
+        // A companion note (no marker, no fork-like keys) is silently ignored.
         write(
             &root.join(".forksan/forks/maint/deep/notes.md"),
-            "no frontmatter body",
+            "no frontmatter reference material",
         );
         // Ignored: dotfiles, non-md files, dirs without FORK.md are recursed only.
         write(&root.join(".forksan/forks/.hidden.md"), "x");
@@ -169,8 +188,8 @@ mod tests {
 
         let (entries, warnings) = discover_forks(&root, None);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["cleanup", "journal", "notes"]);
-        assert!(warnings.is_empty());
+        assert_eq!(names, vec!["cleanup", "journal"]);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
         let journal = entries.iter().find(|e| e.name == "journal").unwrap();
         assert_eq!(journal.parsed.def.description.as_deref(), Some("j"));
         // Roots are canonicalized (macOS /var vs /private/var).
@@ -181,16 +200,59 @@ mod tests {
     }
 
     #[test]
+    fn companion_note_with_fork_like_keys_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("p");
+        // A real fork.
+        write(
+            &root.join(".forksan/forks/real.md"),
+            "---\nfork: true\nrun_on: [idle]\n---\nbody",
+        );
+        // A migration mistake: fork keys but no marker → warned, not a fork.
+        write(
+            &root.join(".forksan/forks/oops.md"),
+            "---\nrun_on: [idle]\nthrottle: 1h\n---\nbody",
+        );
+        // Explicit opt-out and a plain note → silent.
+        write(
+            &root.join(".forksan/forks/note.md"),
+            "---\nfork: false\nrun_on: [idle]\n---\nb",
+        );
+        write(&root.join(".forksan/forks/plain.md"), "just notes");
+
+        let (entries, warnings) = discover_forks(&root, None);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no `fork: true`"), "{}", warnings[0]);
+    }
+
+    #[test]
     fn upward_traversal_and_project_overrides_user() {
         let tmp = tempfile::tempdir().unwrap();
         let outer = tmp.path().join("outer");
         let inner = outer.join("inner");
         let home = tmp.path().join("home");
-        write(&outer.join(".forksan/forks/shared.md"), "outer body");
-        write(&inner.join(".forksan/forks/shared.md"), "inner body");
-        write(&inner.join(".forksan/forks/local.md"), "local");
-        write(&home.join(".forksan/forks/shared.md"), "home body");
-        write(&home.join(".forksan/forks/user.md"), "user");
+        write(
+            &outer.join(".forksan/forks/shared.md"),
+            "---\nfork: true\n---\nouter body",
+        );
+        write(
+            &inner.join(".forksan/forks/shared.md"),
+            "---\nfork: true\n---\ninner body",
+        );
+        write(
+            &inner.join(".forksan/forks/local.md"),
+            "---\nfork: true\n---\nlocal",
+        );
+        write(
+            &home.join(".forksan/forks/shared.md"),
+            "---\nfork: true\n---\nhome body",
+        );
+        write(
+            &home.join(".forksan/forks/user.md"),
+            "---\nfork: true\n---\nuser",
+        );
         fs::create_dir_all(&inner).unwrap();
 
         let (entries, warnings) = discover_forks(&inner, Some(&home.join(".forksan/forks")));
@@ -207,7 +269,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("p");
         write(&root.join(".forksan/forks/bad.md"), "---\n: [oops\n---\nb");
-        write(&root.join(".forksan/forks/good.md"), "fine");
+        write(
+            &root.join(".forksan/forks/good.md"),
+            "---\nfork: true\n---\nfine",
+        );
         let (entries, warnings) = discover_forks(&root, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "good");

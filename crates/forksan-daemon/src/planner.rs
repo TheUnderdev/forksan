@@ -1,22 +1,47 @@
-//! The selection pipeline and plan execution for one set of fork moments.
+//! The selection pipeline: turn a set of fork moments for one session into a
+//! wake payload (or nothing).
 //!
-//! Pipeline (order matters): refresh discovery → queue
-//! roster → live re-read each rostered fork → tag filter (per-session
-//! enable/disable, falling back to config) → match moments → skip-ran-after
-//! guard (boot sweep) → throttle → per-tag throttle → context/boot latch → dependency
-//! resolution → execution (a readiness-counted DAG: each fork runs once all
-//! its `after` dependencies finished, receiving their reports; the first
-//! root runs alone for provider cache warming, the rest under the
-//! concurrency cap).
+//! Pipeline (order matters): refresh discovery → queue roster → live re-read
+//! each rostered fork → tag filter (per-session enable/disable, falling back
+//! to config) → match moments → per-fork throttle → per-tag throttle →
+//! once-per-session latch (context triggers) → dependency resolution → build
+//! the wake payload. When a wake is issued, per-fork and per-tag throttles are
+//! stamped (the daemon can't observe fork completion, so it stamps at
+//! wake-issuance).
 
 use crate::daemon::{now, Daemon};
-use crate::runner::{run_one_fork, Predecessor, SelectedFork};
-use forksan_core::frontmatter::parse_fork_file;
+use forksan_core::config::Config;
+use forksan_core::frontmatter::{ForkParse, ForkRunOn};
 use forksan_core::moments::{match_moments, ForkMoment};
-use forksan_core::schedule::resolve_deps;
+use forksan_core::schedule::{resolve_deps, Selected};
+use forksan_core::store::SessionRow;
 use forksan_core::tags::tags_allowed;
-use std::path::Path;
+use forksan_core::wake::{build_wake_payload, DueFork};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// A fork selected to fire at the current moment.
+#[derive(Clone)]
+pub struct SelectedFork {
+    pub name: String,
+    pub path: PathBuf,
+    pub trigger: String,
+    pub overlap: bool,
+    pub after: Vec<String>,
+    pub tags: Vec<String>,
+    /// True for context triggers, which fire at most once per session and so
+    /// get latched at wake-issuance.
+    pub once_per_session: bool,
+}
+
+impl Selected for SelectedFork {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn after(&self) -> Vec<&str> {
+        self.after.iter().map(|a| a.as_str()).collect()
+    }
+}
 
 /// Refresh discovery for a session's cwd and queue every visible fork onto
 /// the session's roster.
@@ -32,39 +57,22 @@ pub fn refresh_roster(daemon: &Arc<Daemon>, session_id: &str, cwd: &Path) {
     }
 }
 
-/// Run every rostered fork that matches `moments` for this session.
-///
-/// `skip_ran_after`: boot-sweep guard — skip forks whose `ran_at` is after
-/// this cutoff (they already ran for this idle period before a daemon
-/// death). `spawned`: fired once every root fork's subprocess exists (the
-/// PreCompact snapshot barrier); sending implies plan selection is final.
-pub async fn run_moments(
+/// Run the selection pipeline for `moments` and return the forks that should
+/// fire (empty = nothing due). Read-only / side-effect-free: no latches or
+/// throttles are stamped here (that happens at wake-issuance in [`build_wake`],
+/// so a wait cancelled during the debounce window stamps nothing).
+pub fn select_forks(
     daemon: &Arc<Daemon>,
-    session_id: &str,
+    session: &SessionRow,
+    cfg: &Config,
     moments: &[ForkMoment],
-    skip_ran_after: Option<i64>,
-    spawned: Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    let Some(session) = ({
-        let store = daemon.store.lock().unwrap();
-        store.get_session(session_id).ok().flatten()
-    }) else {
-        if let Some(tx) = spawned {
-            let _ = tx.send(());
-        }
-        return;
-    };
-    let cfg = daemon.cfg_for(Some(&session.project_root));
+) -> Vec<SelectedFork> {
+    refresh_roster(daemon, &session.session_id, &session.cwd);
 
-    refresh_roster(daemon, session_id, &session.cwd);
-
-    // Selection.
     let roster = {
         let store = daemon.store.lock().unwrap();
-        store.roster(session_id).unwrap_or_default()
+        store.roster(&session.session_id).unwrap_or_default()
     };
-    // Effective tag filter for this session: the session's own values (from
-    // the hook env) if set, else the config defaults.
     let effective_enable = session
         .enable_tags
         .as_deref()
@@ -77,14 +85,12 @@ pub async fn run_moments(
     let mut selected: Vec<SelectedFork> = Vec::new();
     let t = now();
     for entry in roster {
-        // Live re-read: the file is the source of truth at fire time.
         let Ok(content) = std::fs::read_to_string(&entry.fork_path) else {
             continue;
         };
-        let Some(parsed) = parse_fork_file(&entry.fork_name, &content) else {
+        let ForkParse::Fork(parsed) = parse_fork(&entry.fork_name, &content) else {
             continue;
         };
-        // Per-session enable/disable tag filter (manual runs bypass this).
         if !tags_allowed(&parsed.def.tags, effective_enable, effective_disable) {
             continue;
         }
@@ -92,20 +98,14 @@ pub async fn run_moments(
         else {
             continue;
         };
-        if let (Some(cutoff), Some(ran_at)) = (skip_ran_after, entry.ran_at) {
-            if ran_at > cutoff {
-                continue;
-            }
-        }
+        // Per-fork throttle.
         if let (Some(throttle), Some(ran_at)) = (parsed.def.throttle_secs, entry.ran_at) {
             if (t - ran_at).max(0) < throttle as i64 {
                 tracing::debug!(fork = %entry.fork_name, "throttled, skipping");
                 continue;
             }
         }
-        // Per-tag shared throttle: a run of any fork carrying a throttled tag
-        // suppresses every fork sharing that tag until the window passes
-        // (project scope, like the per-fork throttle's last run).
+        // Per-tag shared throttle.
         if !parsed.def.tags.is_empty() && !cfg.tag_throttles.is_empty() {
             let store = daemon.store.lock().unwrap();
             let mut hit = None;
@@ -128,175 +128,96 @@ pub async fn run_moments(
                 continue;
             }
         }
-        // Context thresholds and boot fire at most once per session leg.
+        // Context thresholds fire at most once per session leg; skip a fork
+        // already latched (read-only — the latch is consumed at issuance).
         let label = trigger.label();
         let once_per_session = matches!(
             trigger,
-            forksan_core::frontmatter::ForkRunOn::ContextTokens(_)
-                | forksan_core::frontmatter::ForkRunOn::ContextUsedPct(_)
-                | forksan_core::frontmatter::ForkRunOn::ContextLeft(_)
-                | forksan_core::frontmatter::ForkRunOn::Boot
+            ForkRunOn::ContextTokens(_) | ForkRunOn::ContextUsedPct(_) | ForkRunOn::ContextLeft(_)
         );
         if once_per_session {
             let latched = {
                 let store = daemon.store.lock().unwrap();
                 store
-                    .try_latch_fire(session_id, &entry.fork_name, &label, t)
+                    .is_latched(&session.session_id, &entry.fork_name, &label)
                     .unwrap_or(false)
             };
-            if !latched {
+            if latched {
                 continue;
             }
         }
         selected.push(SelectedFork {
             name: entry.fork_name.clone(),
             path: entry.fork_path.clone(),
-            def: parsed.def,
-            body: parsed.body,
             trigger: label,
+            overlap: parsed.def.overlap,
+            after: parsed.def.after.clone(),
+            tags: parsed.def.tags.clone(),
+            once_per_session,
         });
     }
-
-    if selected.is_empty() {
-        if let Some(tx) = spawned {
-            let _ = tx.send(());
-        }
-        return;
-    }
-    tracing::info!(
-        session = session_id,
-        forks = ?selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-        "fork moment firing"
-    );
-
-    let deps = resolve_deps(&selected);
-    run_plan(daemon, &cfg, &session, selected, deps, spawned).await;
-
-    let store = daemon.store.lock().unwrap();
-    let _ = store.set_forks_ran_at(session_id, now());
+    selected
 }
 
-/// Execute a resolved plan: each fork runs as soon as all its dependencies
-/// finished (readiness counting), receiving their outcomes as predecessors.
-/// Without a barrier the first root runs alone (the provider cache entry for
-/// the shared context prefix only exists once a first response begins) and
-/// the rest respect the concurrency cap; in barrier mode (PreCompact) every
-/// root spawns immediately, uncapped, and `spawned` fires once all their
-/// subprocesses exist so compaction can't outrun the snapshots.
-async fn run_plan(
+fn parse_fork(name: &str, content: &str) -> ForkParse {
+    forksan_core::frontmatter::parse_fork_file(name, content)
+}
+
+/// Given the forks selected to fire, stamp their throttles (per-fork and
+/// per-tag) and build the wake payload the session should act on. Returns
+/// `None` when `selected` is empty.
+pub fn build_wake(
     daemon: &Arc<Daemon>,
-    cfg: &forksan_core::config::Config,
-    session: &forksan_core::store::SessionRow,
-    nodes: Vec<SelectedFork>,
-    deps: Vec<Vec<usize>>,
-    spawned: Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    let n = nodes.len();
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, d) in deps.iter().enumerate() {
-        for &p in d {
-            dependents[p].push(i);
-        }
+    session: &SessionRow,
+    selected: Vec<SelectedFork>,
+) -> Option<String> {
+    if selected.is_empty() {
+        return None;
     }
-    let mut remaining: Vec<usize> = deps.iter().map(|d| d.len()).collect();
-    let roots = forksan_core::schedule::roots(&deps);
-    let barrier_mode = spawned.is_some();
+    tracing::info!(
+        session = %session.session_id,
+        forks = ?selected.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        "issuing wake"
+    );
 
-    let nodes = Arc::new(nodes);
-    let outcomes: Arc<std::sync::Mutex<Vec<Option<Predecessor>>>> =
-        Arc::new(std::sync::Mutex::new(vec![None; n]));
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-    let cap = if barrier_mode {
-        n.max(1)
-    } else {
-        cfg.concurrency
-    };
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(cap));
+    // Resolve `after` dependencies within the selected set.
+    let deps = resolve_deps(&selected);
 
-    let spawn_node = |idx: usize, spawn_sig: Option<tokio::sync::oneshot::Sender<()>>| {
-        let daemon = daemon.clone();
-        let cfg = cfg.clone();
-        let sid = session.session_id.clone();
-        let proot = session.project_root.clone();
-        let cwd = session.cwd.clone();
-        let nodes = nodes.clone();
-        let deps_of = deps[idx].clone();
-        let outcomes = outcomes.clone();
-        let done_tx = done_tx.clone();
-        let semaphore = semaphore.clone();
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire_owned().await;
-            // Dependencies are complete by construction; failed ones simply
-            // contribute no predecessor.
-            let preds: Vec<Predecessor> = {
-                let o = outcomes.lock().unwrap();
-                deps_of.iter().filter_map(|d| o[*d].clone()).collect()
-            };
-            let outcome = run_one_fork(
-                &daemon,
-                &cfg,
-                &sid,
-                &proot,
-                &cwd,
-                &nodes[idx],
-                &preds,
-                spawn_sig,
-            )
-            .await;
-            if let Some(o) = outcome {
-                outcomes.lock().unwrap()[idx] = Some(Predecessor {
-                    name: nodes[idx].name.clone(),
-                    reply: o.reply,
-                    fork_session_id: o.fork_session_id,
-                });
-            }
-            let _ = done_tx.send(idx);
-        });
-    };
-
-    let mut completed = 0usize;
-    if barrier_mode {
-        let mut waits = Vec::new();
-        for &root in &roots {
-            let (stx, srx) = tokio::sync::oneshot::channel();
-            waits.push(srx);
-            spawn_node(root, Some(stx));
-        }
-        for w in waits {
-            let _ = w.await;
-        }
-        if let Some(tx) = spawned {
-            let _ = tx.send(());
-        }
-    } else {
-        // Leader alone first, then the remaining roots.
-        if let Some(&leader) = roots.first() {
-            spawn_node(leader, None);
-            if let Some(idx) = done_rx.recv().await {
-                completed += 1;
-                for &dep in &dependents[idx] {
-                    remaining[dep] -= 1;
-                    if remaining[dep] == 0 {
-                        spawn_node(dep, None);
-                    }
-                }
-            }
-        }
-        for &root in roots.iter().skip(1) {
-            spawn_node(root, None);
-        }
-    }
-
-    while completed < n {
-        let Some(idx) = done_rx.recv().await else {
-            break;
-        };
-        completed += 1;
-        for &dep in &dependents[idx] {
-            remaining[dep] -= 1;
-            if remaining[dep] == 0 {
-                spawn_node(dep, None);
+    // Stamp throttles and once-per-session latches at wake-issuance.
+    let t = now();
+    {
+        let store = daemon.store.lock().unwrap();
+        for sel in &selected {
+            let _ = store.touch_fork_ran(&session.session_id, &sel.name, t);
+            let tags_joined = (!sel.tags.is_empty()).then(|| sel.tags.join(","));
+            let _ = store.record_issued_run(
+                &session.session_id,
+                &sel.name,
+                &sel.trigger,
+                tags_joined.as_deref(),
+                t,
+            );
+            if sel.once_per_session {
+                let _ = store.try_latch_fire(&session.session_id, &sel.name, &sel.trigger, t);
             }
         }
     }
+
+    let due: Vec<DueFork> = selected
+        .iter()
+        .enumerate()
+        .map(|(i, sel)| DueFork {
+            name: sel.name.clone(),
+            path: sel.path.to_string_lossy().into_owned(),
+            trigger: sel.trigger.clone(),
+            overlap: sel.overlap,
+            after: deps[i].iter().map(|&j| selected[j].name.clone()).collect(),
+        })
+        .collect();
+
+    Some(build_wake_payload(
+        &session.session_id,
+        &session.project_root.to_string_lossy(),
+        &due,
+    ))
 }

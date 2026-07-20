@@ -1,15 +1,15 @@
 //! `forksan hook <event>`: the Claude Code hook entrypoint. Reads the hook
-//! JSON from stdin, forwards it to the daemon, and (where the event supports
-//! it) emits `hookSpecificOutput.additionalContext` JSON on stdout.
+//! JSON from stdin and forwards it to the daemon.
 //!
-//! Hooks must never break the user's session: every failure path exits 0.
+//! The Stop hook (`stop-wait`) is an asyncRewake command: it long-polls the
+//! daemon and, when forks come due, prints the wake payload to stderr and
+//! exits 2 so Claude Code wakes the idle session. Every other path — and every
+//! failure — exits 0 so a hook never breaks or wedges the session.
 
 use crate::client::{spawn_daemon_detached, Client};
 use forksan_core::config::Paths;
 use forksan_core::project::project_root;
-use forksan_core::protocol::{
-    Event, EventKind, ReportItem, ReportKind, RequestBody, ResponseBody, WaitMode,
-};
+use forksan_core::protocol::{Event, EventKind, RequestBody, ResponseBody};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,8 +18,8 @@ use std::time::Duration;
 pub enum HookKind {
     SessionStart,
     UserPromptSubmit,
-    Stop,
-    PreCompact,
+    /// The asyncRewake Stop hook (`stop-wait`): long-poll for due forks.
+    StopWait,
     SessionEnd,
 }
 
@@ -34,26 +34,19 @@ struct HookInput {
     #[serde(default)]
     source: Option<String>,
     #[serde(default)]
-    trigger: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
     model: Option<String>,
 }
 
 pub fn run_hook(kind: HookKind) {
-    // Never break the session, whatever happens in here.
+    // Never break the session, whatever happens in here. (The stop-wait Wake
+    // path exits 2 inline; every other path returns and main exits 0.)
     let _ = run_hook_inner(kind);
 }
 
 fn run_hook_inner(kind: HookKind) -> Option<()> {
-    // Recursion guard. A fork subprocess inherits the fork's environment,
-    // which carries `FORKSAN_FORK` (and `FORKSAN_SESSION_ID`). In open
-    // isolation the fork loads the user's full config, including forksan's own
-    // plugin, so its hooks would re-enter the daemon and spawn forks of forks.
-    // These vars are set ONLY by the runner and must NEVER be exported into a
-    // real Claude Code session — their presence means "we are inside a fork",
-    // so do nothing: no output, no daemon contact, no spawn.
+    // Recursion guard, kept as zero-cost defense in depth: fork subagents emit
+    // SubagentStop, not Stop, so they never reach the trigger path — but if a
+    // fork's environment ever carried these vars, do nothing.
     if std::env::var_os("FORKSAN_FORK").is_some()
         || std::env::var_os("FORKSAN_SESSION_ID").is_some()
     {
@@ -72,19 +65,16 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     let enable_tags = tags_from_env("FORKSAN_ENABLE_TAGS");
     let disable_tags = tags_from_env("FORKSAN_DISABLE_TAGS");
 
-    let event = |ev: EventKind, wait: WaitMode| Event {
+    let event = |ev: EventKind| Event {
         event: ev,
         session_id: input.session_id.clone(),
         transcript_path: input.transcript_path.clone(),
         cwd: cwd.clone(),
         project_root: root.clone(),
         source: input.source.clone(),
-        trigger: input.trigger.clone(),
-        reason: input.reason.clone(),
         model: input.model.clone(),
         enable_tags: enable_tags.clone(),
         disable_tags: disable_tags.clone(),
-        wait,
     };
 
     match kind {
@@ -92,52 +82,32 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
             // SessionStart has slack: spawn-and-wait, retire outdated daemons.
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
-            let _ = client.request(RequestBody::Event(event(
-                EventKind::SessionStart,
-                WaitMode::None,
-            )));
-            let budget = poll_budget(&paths, &root);
-            if let Ok(ResponseBody::Reports { items }) = client.request(RequestBody::PollReports {
-                session_id: input.session_id.clone(),
-                project_root: root.clone(),
-                budget_chars: budget,
-            }) {
-                emit_context("SessionStart", &items);
-            }
+            let _ = client.request(RequestBody::Event(event(EventKind::SessionStart)));
         }
         HookKind::UserPromptSubmit => {
-            // Hard 2s budget; never wait on a daemon spawn here.
+            // Hard budget; never wait on a daemon spawn here. This cancels any
+            // parked stop-wait so no fork fires mid-turn.
             let Ok(mut client) = Client::connect(&paths, Duration::from_millis(1500)) else {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
-            if let Ok(ResponseBody::Reports { items }) = client.request(RequestBody::Event(event(
-                EventKind::PromptSubmit,
-                WaitMode::None,
-            ))) {
-                emit_context("UserPromptSubmit", &items);
-            }
+            let _ = client.request(RequestBody::Event(event(EventKind::PromptSubmit)));
         }
-        HookKind::Stop => {
-            // Runs async (Claude Code doesn't wait): fine to spawn + retire.
+        HookKind::StopWait => {
+            // Runs async (Claude Code doesn't block): fine to spawn + retire.
             let client = Client::connect_or_spawn(&paths, Duration::from_secs(10)).ok()?;
             let mut client = client.ensure_current_version(&paths).ok()?;
-            let _ = client.request(RequestBody::Event(event(EventKind::Stop, WaitMode::None)));
-        }
-        HookKind::PreCompact => {
-            let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
-            // The daemon acks once compact forks are spawned (≤15s inside).
-            let _ = client.request(RequestBody::Event(event(
-                EventKind::PreCompact,
-                WaitMode::ForksSpawned,
-            )));
+            // Long-poll until forks are due or the wait is cancelled/retired.
+            // Waited / error / closed socket / proto skew: exit 0 silently.
+            if let Ok(ResponseBody::Wake { payload }) = client.stop_wait(event(EventKind::Stop)) {
+                // Wake the idle session: stderr shown as a system reminder.
+                eprintln!("{payload}");
+                std::process::exit(2);
+            }
         }
         HookKind::SessionEnd => {
             let mut client = Client::connect_or_spawn(&paths, Duration::from_secs(5)).ok()?;
-            let _ = client.request(RequestBody::Event(event(
-                EventKind::SessionEnd,
-                WaitMode::None,
-            )));
+            let _ = client.request(RequestBody::Event(event(EventKind::SessionEnd)));
         }
     }
     Some(())
@@ -160,37 +130,4 @@ fn tags_from_env(var: &str) -> Option<Vec<String>> {
     } else {
         Some(out)
     }
-}
-
-fn poll_budget(paths: &Paths, root: &std::path::Path) -> usize {
-    forksan_core::config::load_config_at(Some(root), &paths.user_config())
-        .0
-        .poll_budget_chars
-}
-
-/// Render the reports as frontmatter blocks and print the hook decision JSON.
-fn emit_context(hook_event_name: &str, items: &[ReportItem]) {
-    if items.is_empty() {
-        return;
-    }
-    let blocks: Vec<String> = items
-        .iter()
-        .map(|item| {
-            let event = match item.kind {
-                ReportKind::Started => "fork_started",
-                ReportKind::Response => "fork_response",
-            };
-            format!(
-                "---\nsource: forksan\nfork: {}\ntrigger: {}\nevent: {}\n---\n{}",
-                item.fork, item.trigger, event, item.body
-            )
-        })
-        .collect();
-    let payload = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": hook_event_name,
-            "additionalContext": blocks.join("\n\n"),
-        }
-    });
-    println!("{payload}");
 }

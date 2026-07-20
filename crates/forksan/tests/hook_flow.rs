@@ -1,23 +1,23 @@
-//! CLI hook-path tests: the `forksan hook <event>` entrypoint end-to-end,
-//! including daemon auto-spawn and the spawn race.
+//! CLI hook-path tests for `forksan hook <event>`.
+//!
+//! The stop-wait long poll is exercised against a *mock* daemon socket (so we
+//! can assert exit codes and stderr precisely) plus one real-daemon end-to-end
+//! wake. The fast events are covered against the real auto-spawned daemon.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
-const STUB: &str = r#"#!/bin/sh
-INPUT=$(cat)
-mkdir -p "$STUB_DIR"
-printf '%s' "$INPUT" > "$STUB_DIR/prompt-$$.txt"
-printf '{"result":"cli stub report","session_id":"stub-x","total_cost_usd":0.01,"is_error":false}\n'
-"#;
+use forksan_core::protocol::{encode, Request, RequestBody, Response, ResponseBody};
+use forksan_core::PROTO_VERSION;
 
 struct Env {
     _tmp: tempfile::TempDir,
     home: PathBuf,
     socket: PathBuf,
-    stub_dir: PathBuf,
     project: PathBuf,
 }
 
@@ -26,40 +26,37 @@ impl Env {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_path_buf();
         let home = base.join("fsan");
-        let stub_dir = base.join("stub");
         let project = base.join("proj");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(project.join(".forksan/forks")).unwrap();
-        let stub = base.join("claude-stub");
-        std::fs::write(&stub, STUB).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         std::fs::write(
             home.join("config.toml"),
-            format!(
-                "default_idle_deadline = \"{idle}\"\nquiet_period = \"1h\"\nfork_timeout = 10\nclaude_bin = \"{}\"\n",
-                stub.display()
-            ),
+            format!("default_idle_deadline = \"{idle}\"\nquiet_period = \"1h\"\nwake_debounce = \"0\"\n"),
         )
         .unwrap();
         Self {
             socket: base.join("d.sock"),
             _tmp: tmp,
             home,
-            stub_dir,
             project,
         }
     }
 
-    fn hook(&self, event: &str, stdin_json: &serde_json::Value) -> (String, String) {
+    fn hook_input(&self, session: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session,
+            "transcript_path": self.project.join("t.jsonl"),
+            "cwd": self.project,
+            "hook_event_name": "whatever",
+        })
+    }
+
+    /// Run `forksan hook <event>` to completion; returns (exit_code, stdout, stderr).
+    fn hook(&self, event: &str, stdin_json: &serde_json::Value) -> (Option<i32>, String, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
             .args(["hook", event])
             .env("FORKSAN_HOME", &self.home)
             .env("FORKSAN_SOCKET", &self.socket)
-            .env("STUB_DIR", &self.stub_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -72,31 +69,14 @@ impl Env {
             .write_all(stdin_json.to_string().as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "hook exited nonzero: {out:?}");
         (
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout).to_string(),
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
     }
 
-    fn hook_input(&self, session: &str) -> serde_json::Value {
-        serde_json::json!({
-            "session_id": session,
-            "transcript_path": self.project.join("t.jsonl"),
-            "cwd": self.project,
-            "hook_event_name": "whatever",
-        })
-    }
-
-    fn stub_ran(&self) -> bool {
-        std::fs::read_dir(&self.stub_dir)
-            .map(|d| d.count() > 0)
-            .unwrap_or(false)
-    }
-
     fn kill_daemon(&self) {
-        // Retire via the frozen shutdown frame so tempdirs can be dropped.
-        use std::os::unix::net::UnixStream;
         if let Ok(mut s) = UnixStream::connect(&self.socket) {
             let _ = s.write_all(b"{\"proto\":1,\"id\":1,\"type\":\"shutdown\",\"drain\":false}\n");
             std::thread::sleep(Duration::from_millis(200));
@@ -110,49 +90,147 @@ impl Drop for Env {
     }
 }
 
+/// A mock daemon that answers Hello (as a very new version, so no retire) and
+/// answers the first StopWait with `stop_wait_response`, then stops.
+fn mock_daemon(socket: PathBuf, stop_wait_response: ResponseBody) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let listener = UnixListener::bind(&socket).unwrap();
+        for conn in listener.incoming() {
+            let Ok(stream) = conn else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            let mut done = false;
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let req: Request = match serde_json::from_str(line.trim()) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let body = match req.body {
+                    RequestBody::Hello { .. } => ResponseBody::HelloInfo {
+                        version: "999.0.0".into(),
+                    },
+                    RequestBody::StopWait(_) => {
+                        done = true;
+                        stop_wait_response.clone()
+                    }
+                    _ => ResponseBody::Ack,
+                };
+                let resp = Response {
+                    proto: PROTO_VERSION,
+                    id: req.id,
+                    body,
+                };
+                let _ = writer.write_all(encode(&resp).unwrap().as_bytes());
+                line.clear();
+                if done {
+                    break;
+                }
+            }
+            break;
+        }
+    })
+}
+
+fn wait_for_socket(path: &std::path::Path) {
+    let start = Instant::now();
+    while !path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "mock never bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
-fn full_hook_cycle_delivers_report_via_additional_context() {
+fn stop_wait_wake_exits_2_with_payload_on_stderr() {
+    let env = Env::new("1h");
+    let handle = mock_daemon(
+        env.socket.clone(),
+        ResponseBody::Wake {
+            payload: "WAKE_PAYLOAD_MARKER".into(),
+        },
+    );
+    wait_for_socket(&env.socket);
+
+    let (code, stdout, stderr) = env.hook("stop-wait", &env.hook_input("s1"));
+    assert_eq!(code, Some(2), "wake must exit 2");
+    assert!(
+        stderr.contains("WAKE_PAYLOAD_MARKER"),
+        "payload not on stderr: {stderr}"
+    );
+    assert!(stdout.trim().is_empty(), "unexpected stdout: {stdout}");
+    let _ = handle.join();
+}
+
+#[test]
+fn stop_wait_waited_exits_0() {
+    let env = Env::new("1h");
+    let handle = mock_daemon(env.socket.clone(), ResponseBody::Waited);
+    wait_for_socket(&env.socket);
+
+    let (code, _stdout, _stderr) = env.hook("stop-wait", &env.hook_input("s1"));
+    assert_eq!(code, Some(0), "a cancelled wait must exit 0 silently");
+    let _ = handle.join();
+}
+
+#[test]
+fn stop_wait_closed_socket_exits_0() {
+    // Mock that binds, answers Hello, then closes the connection mid-poll (as a
+    // retiring daemon would). The hook must exit 0, never wedge.
+    let env = Env::new("1h");
+    let socket = env.socket.clone();
+    let handle = thread::spawn(move || {
+        let listener = UnixListener::bind(&socket).unwrap();
+        if let Some(Ok(stream)) = listener.incoming().next() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            // Answer Hello, then drop on the StopWait.
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let req: Request = serde_json::from_str(line.trim()).unwrap();
+                match req.body {
+                    RequestBody::Hello { .. } => {
+                        let resp = Response {
+                            proto: PROTO_VERSION,
+                            id: req.id,
+                            body: ResponseBody::HelloInfo {
+                                version: "999.0.0".into(),
+                            },
+                        };
+                        let _ = writer.write_all(encode(&resp).unwrap().as_bytes());
+                    }
+                    RequestBody::StopWait(_) => break, // close without answering
+                    _ => {}
+                }
+                line.clear();
+            }
+        }
+    });
+    wait_for_socket(&env.socket);
+
+    let (code, _o, _e) = env.hook("stop-wait", &env.hook_input("s1"));
+    assert_eq!(code, Some(0), "closed socket mid-poll must exit 0");
+    let _ = handle.join();
+}
+
+#[test]
+fn real_daemon_stop_wait_wakes_on_idle() {
     let env = Env::new("1s");
     std::fs::write(
         env.project.join(".forksan/forks/journal.md"),
-        "---\nrun_on: [idle]\n---\nJOURNAL BODY",
+        "---\nfork: true\nrun_on: [idle]\n---\nJOURNAL BODY",
     )
     .unwrap();
 
-    // session-start auto-spawns the daemon.
-    let (out, _) = env.hook("session-start", &env.hook_input("s1"));
-    assert!(out.trim().is_empty(), "no reports yet: {out}");
+    // session-start auto-spawns the real daemon and registers the session.
+    let (code, _o, _e) = env.hook("session-start", &env.hook_input("s1"));
+    assert_eq!(code, Some(0));
 
-    // stop arms the idle clock; the fork fires at 1s.
-    env.hook("stop", &env.hook_input("s1"));
-    let start = Instant::now();
-    while !env.stub_ran() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "idle fork never ran"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    std::thread::sleep(Duration::from_millis(500));
-
-    // The next prompt gets the report as additionalContext.
-    let (out, _) = env.hook("user-prompt-submit", &env.hook_input("s1"));
-    let payload: serde_json::Value = serde_json::from_str(out.trim()).expect("json output");
-    let ctx = payload["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        payload["hookSpecificOutput"]["hookEventName"],
-        "UserPromptSubmit"
-    );
-    assert!(ctx.contains("source: forksan"));
-    assert!(ctx.contains("fork: journal"));
-    assert!(ctx.contains("event: fork_response"));
-    assert!(ctx.contains("cli stub report"));
-
-    // Delivered once.
-    let (out, _) = env.hook("user-prompt-submit", &env.hook_input("s1"));
-    assert!(out.trim().is_empty(), "double delivery: {out}");
+    // stop-wait blocks until the 1s idle deadline, then wakes (exit 2).
+    let (code, _stdout, stderr) = env.hook("stop-wait", &env.hook_input("s1"));
+    assert_eq!(code, Some(2), "real daemon should wake at idle");
+    assert!(stderr.contains("source: forksan"));
+    assert!(stderr.contains("due: journal"));
+    assert!(stderr.contains("subagent_type \"fork\""));
 }
 
 #[test]
@@ -160,19 +238,42 @@ fn disable_tags_env_filters_fork() {
     let env = Env::new("1s");
     std::fs::write(
         env.project.join(".forksan/forks/tagged.md"),
-        "---\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED BODY",
+        "---\nfork: true\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED BODY",
     )
     .unwrap();
 
-    // The hook inherits FORKSAN_DISABLE_TAGS=ci from the Claude Code env and
-    // carries it on the wire; the tagged fork must be filtered out.
-    let run_hook = |event: &str| {
+    let run = |event: &str| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
             .args(["hook", event])
             .env("FORKSAN_HOME", &env.home)
             .env("FORKSAN_SOCKET", &env.socket)
-            .env("STUB_DIR", &env.stub_dir)
             .env("FORKSAN_DISABLE_TAGS", "ci")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(env.hook_input("s1").to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    assert_eq!(run("session-start").status.code(), Some(0));
+    // The disabled fork never comes due; the wait parks. Give it a moment past
+    // the 1s deadline, then a prompt cancels it → exit 0 (never a wake/exit 2).
+    let home = env.home.clone();
+    let socket = env.socket.clone();
+    let stdin = env.hook_input("s1").to_string();
+    let handle = thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1800));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+            .args(["hook", "user-prompt-submit"])
+            .env("FORKSAN_HOME", &home)
+            .env("FORKSAN_SOCKET", &socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -182,19 +283,13 @@ fn disable_tags_env_filters_fork() {
             .stdin
             .take()
             .unwrap()
-            .write_all(env.hook_input("s1").to_string().as_bytes())
+            .write_all(stdin.as_bytes())
             .unwrap();
-        assert!(child.wait().unwrap().success());
-    };
-
-    run_hook("session-start");
-    run_hook("stop");
-    // Well past the 1s idle deadline: the disabled fork must not have run.
-    std::thread::sleep(Duration::from_millis(1800));
-    assert!(
-        !env.stub_ran(),
-        "disabled fork ran despite FORKSAN_DISABLE_TAGS"
-    );
+        let _ = child.wait();
+    });
+    let out = run("stop-wait");
+    assert_eq!(out.status.code(), Some(0), "disabled fork woke the session");
+    let _ = handle.join();
 }
 
 #[test]
@@ -202,17 +297,14 @@ fn fork_env_guard_short_circuits_hook() {
     let env = Env::new("1h");
     std::fs::write(
         env.project.join(".forksan/forks/journal.md"),
-        "---\nrun_on: [session_start]\n---\nBODY",
+        "---\nfork: true\nrun_on: [idle]\n---\nBODY",
     )
     .unwrap();
 
-    // A hook running inside a fork subprocess inherits FORKSAN_FORK; it must do
-    // nothing at all — no output, no daemon contact, no spawn.
     let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
-        .args(["hook", "session-start"])
+        .args(["hook", "stop-wait"])
         .env("FORKSAN_HOME", &env.home)
         .env("FORKSAN_SOCKET", &env.socket)
-        .env("STUB_DIR", &env.stub_dir)
         .env("FORKSAN_FORK", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -226,26 +318,19 @@ fn fork_env_guard_short_circuits_hook() {
         .write_all(env.hook_input("s1").to_string().as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "guarded hook exited nonzero: {out:?}");
-    assert!(
-        out.stdout.is_empty(),
-        "guarded hook produced output: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-
-    // No daemon was spawned.
-    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(out.status.code(), Some(0), "guarded hook must exit 0");
+    assert!(out.stdout.is_empty(), "guarded hook produced stdout");
+    assert!(out.stderr.is_empty(), "guarded hook produced stderr");
+    std::thread::sleep(Duration::from_millis(300));
     assert!(
         !env.socket.exists(),
         "a daemon was spawned despite the fork guard"
     );
-    assert!(!env.stub_ran(), "a fork ran despite the guard");
 }
 
 #[test]
-fn concurrent_hooks_race_to_one_daemon() {
+fn concurrent_session_starts_race_to_one_daemon() {
     let env = Env::new("1h");
-    // Several session-starts at once: exactly one daemon must win.
     let mut children = Vec::new();
     for i in 0..5 {
         let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
@@ -268,7 +353,6 @@ fn concurrent_hooks_race_to_one_daemon() {
     for mut c in children {
         assert!(c.wait().unwrap().success());
     }
-    // All five sessions landed in one daemon.
     let out = Command::new(env!("CARGO_BIN_EXE_forksan"))
         .arg("status")
         .env("FORKSAN_HOME", &env.home)
@@ -285,8 +369,7 @@ fn hook_never_fails_on_garbage_stdin() {
     for event in [
         "session-start",
         "user-prompt-submit",
-        "stop",
-        "pre-compact",
+        "stop-wait",
         "session-end",
     ] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
@@ -300,7 +383,10 @@ fn hook_never_fails_on_garbage_stdin() {
             .unwrap();
         child.stdin.take().unwrap().write_all(b"not json").unwrap();
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "hook {event} broke on garbage stdin");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "hook {event} broke on garbage stdin"
+        );
     }
-    let _ = Path::new("x");
 }

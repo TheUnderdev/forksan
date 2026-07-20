@@ -1,7 +1,8 @@
 //! Unix-socket JSONL server: one request line in, one response line out.
+//! A `StopWait` request may block for a long time (the asyncRewake Stop hook's
+//! long poll) before its single response is written.
 
-use crate::daemon::{now, Daemon};
-use crate::runner::SelectedFork;
+use crate::daemon::Daemon;
 use forksan_core::protocol::{
     encode, ErrorCode, ForkInfo, Request, RequestBody, Response, ResponseBody, RunInfo,
     SessionInfo, StatusInfo,
@@ -90,26 +91,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
             }
         }
         RequestBody::Event(ev) => daemon.handle_event(ev).await,
-        RequestBody::PollReports {
-            session_id,
-            project_root,
-            budget_chars,
-        } => {
-            let items = {
-                let store = daemon.store.lock().unwrap();
-                store
-                    .poll_reports(&session_id, &project_root, budget_chars, now())
-                    .unwrap_or_default()
-            };
-            ResponseBody::Reports { items }
-        }
-        RequestBody::RunFork {
-            name,
-            project_root,
-            cwd,
-            session_id,
-            tag,
-        } => run_fork_manually(daemon, name, tag, project_root, cwd, session_id).await,
+        RequestBody::StopWait(ev) => daemon.handle_stop_wait(ev).await,
         RequestBody::Status => status(daemon),
         RequestBody::ListForks {
             project_root: _,
@@ -124,17 +106,10 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     path: e.path,
                     description: e.parsed.def.description.clone(),
                     triggers: e.parsed.def.run_on.iter().map(|r| r.label()).collect(),
-                    delivery: match e.parsed.def.delivery {
-                        forksan_core::frontmatter::ForkDelivery::Discard => "discard".into(),
-                        forksan_core::frontmatter::ForkDelivery::NextTurn => "next_turn".into(),
-                    },
                     throttle_secs: e.parsed.def.throttle_secs,
-                    after: e.parsed.def.after.iter().map(|a| a.fork.clone()).collect(),
+                    after: e.parsed.def.after.clone(),
                     overlap: e.parsed.def.overlap,
-                    model: e.parsed.def.model.clone(),
                     tags: e.parsed.def.tags.clone(),
-                    allowed_tools: e.parsed.def.allowed_tools.clone(),
-                    permission_mode: e.parsed.def.permission_mode.clone(),
                     warnings: e
                         .parsed
                         .warnings
@@ -157,104 +132,6 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
     }
 }
 
-/// Manually fire forks: one by `name`, or every fork carrying `tag`. Manual
-/// runs deliberately bypass the per-session tag filter and the per-tag
-/// throttles — the user asked for them explicitly.
-async fn run_fork_manually(
-    daemon: &Arc<Daemon>,
-    name: Option<String>,
-    tag: Option<String>,
-    project_root: std::path::PathBuf,
-    cwd: std::path::PathBuf,
-    session_id: Option<String>,
-) -> ResponseBody {
-    let session = {
-        let store = daemon.store.lock().unwrap();
-        match &session_id {
-            Some(sid) => store.get_session(sid).ok().flatten(),
-            None => store.most_recent_open_session(&project_root).ok().flatten(),
-        }
-    };
-    let Some(session) = session else {
-        return ResponseBody::Error {
-            code: ErrorCode::NotFound,
-            message: "no open session for this project (start a Claude Code session first)".into(),
-        };
-    };
-    let (entries, _) =
-        forksan_core::discovery::discover_forks(&cwd, Some(&daemon.user_forks_root()));
-
-    // Pick the forks to fire: one by name, or all carrying the given tag.
-    let picked: Vec<_> = match (&name, &tag) {
-        (Some(name), _) => match entries.into_iter().find(|e| &e.name == name) {
-            Some(e) => vec![e],
-            None => {
-                return ResponseBody::Error {
-                    code: ErrorCode::NotFound,
-                    message: format!("no fork named '{name}' visible from {}", cwd.display()),
-                };
-            }
-        },
-        (None, Some(tag)) => {
-            let matched: Vec<_> = entries
-                .into_iter()
-                .filter(|e| e.parsed.def.tags.iter().any(|t| t == tag))
-                .collect();
-            if matched.is_empty() {
-                return ResponseBody::Error {
-                    code: ErrorCode::NotFound,
-                    message: format!("no forks with tag '{tag}' visible from {}", cwd.display()),
-                };
-            }
-            matched
-        }
-        (None, None) => {
-            return ResponseBody::Error {
-                code: ErrorCode::BadRequest,
-                message: "run requires a fork name or a tag".into(),
-            };
-        }
-    };
-
-    let cfg = daemon.cfg_for(Some(&session.project_root));
-    let mut started = Vec::new();
-    for entry in picked {
-        let sel = SelectedFork {
-            name: entry.name.clone(),
-            path: entry.path.clone(),
-            def: entry.parsed.def.clone(),
-            body: entry.parsed.body.clone(),
-            trigger: "manual".into(),
-        };
-        {
-            let store = daemon.store.lock().unwrap();
-            let _ = store.queue_fork(&session.session_id, &sel.name, &sel.path, now());
-        }
-        started.push(sel.name.clone());
-        let daemon_ref = daemon.clone();
-        let cfg = cfg.clone();
-        let sid = session.session_id.clone();
-        let proot = session.project_root.clone();
-        let scwd = session.cwd.clone();
-        tokio::spawn(async move {
-            crate::runner::run_one_fork(&daemon_ref, &cfg, &sid, &proot, &scwd, &sel, &[], None)
-                .await;
-        });
-    }
-
-    if name.is_some() {
-        ResponseBody::RunStarted {
-            fork: started.into_iter().next().unwrap_or_default(),
-            session_id: session.session_id,
-        }
-    } else {
-        ResponseBody::RunStartedMany {
-            forks: started,
-            session_id: session.session_id,
-        }
-    }
-}
-
 fn status(daemon: &Arc<Daemon>) -> ResponseBody {
     let store = daemon.store.lock().unwrap();
     let sessions = store
@@ -269,35 +146,23 @@ fn status(daemon: &Arc<Daemon>) -> ResponseBody {
             prompt_tokens: s.prompt_tokens,
         })
         .collect();
-    let to_info = |r: forksan_core::store::RunRow| RunInfo {
-        fork: r.fork_name,
-        trigger: r.trigger_label,
-        session_id: r.session_id,
-        state: r.state,
-        started_at: r.started_at,
-        finished_at: r.finished_at,
-        cost_usd: r.cost_usd,
-        error: r.error,
-    };
-    let running = store
-        .list_runs(&["running"], 50)
-        .unwrap_or_default()
-        .into_iter()
-        .map(to_info)
-        .collect();
     let recent_runs = store
-        .list_runs(&["done", "failed", "interrupted"], 20)
+        .list_runs(&["issued"], 20)
         .unwrap_or_default()
         .into_iter()
-        .map(to_info)
+        .map(|r| RunInfo {
+            fork: r.fork_name,
+            trigger: r.trigger_label,
+            session_id: r.session_id,
+            state: r.state,
+            started_at: r.started_at,
+        })
         .collect();
     ResponseBody::StatusInfo(StatusInfo {
         version: Daemon::version().to_string(),
         daemon_proto: PROTO_VERSION,
         pid: std::process::id(),
         sessions,
-        running,
         recent_runs,
-        queued_reports: store.count_pending_reports().unwrap_or(0),
     })
 }

@@ -1,5 +1,5 @@
 {
-  "description": "forksan: fork moments driven by session lifecycle events",
+  "description": "forksan: fork subagents spawned at idle/context moments via an asyncRewake Stop hook",
   "hooks": {
     "Setup": [
       {
@@ -21,8 +21,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" session-start",
-            "timeout": 20,
-            "statusMessage": "forksan: collecting fork reports"
+            "timeout": 20
           }
         ]
       }
@@ -43,22 +42,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" stop",
-            "async": true,
-            "timeout": 60
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "manual|auto",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh\" pre-compact",
-            "timeout": 30,
-            "statusMessage": "forksan: snapshotting context for compact forks"
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forksan-hook.sh stop-wait",
+            "asyncRewake": true,
+            "timeout": 14400
           }
         ]
       }

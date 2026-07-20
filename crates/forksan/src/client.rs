@@ -3,7 +3,7 @@
 //! timeouts so hook paths never blow their budgets.
 
 use forksan_core::config::Paths;
-use forksan_core::protocol::{encode, Request, RequestBody, Response, ResponseBody};
+use forksan_core::protocol::{encode, Event, Request, RequestBody, Response, ResponseBody};
 use forksan_core::PROTO_VERSION;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -66,6 +66,17 @@ impl Client {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// The asyncRewake Stop hook's long poll: the daemon may hold the response
+    /// for a long time (until forks are due or the wait is cancelled), so the
+    /// read timeout is widened to the hook's own 4h budget. A closed socket
+    /// (daemon retiring mid-poll) surfaces as an error the caller treats as a
+    /// silent exit-0.
+    pub fn stop_wait(&mut self, ev: Event) -> Result<ResponseBody, ClientError> {
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(4 * 3600)))?;
+        self.request(RequestBody::StopWait(ev))
     }
 
     pub fn request(&mut self, body: RequestBody) -> Result<ResponseBody, ClientError> {

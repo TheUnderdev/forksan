@@ -1,67 +1,40 @@
 //! Configuration: `<project_root>/.forksan/config.toml` overrides
 //! `~/.forksan/config.toml` overrides built-in defaults. Keys that only make
 //! sense globally are ignored (with a warning) when set at project level.
+//!
+//! v0.5 removed a batch of keys tied to the old subprocess runner
+//! (`claude_bin`, `concurrency`, `isolation`, `permission_mode`,
+//! `run_timeout`/`fork_timeout`, `context_window`, `[models]`, and the
+//! report/poll budgets). They are accepted-and-warned for backward
+//! compatibility, then ignored — an old config file never hard-errors.
 
 use crate::duration::parse_duration_str;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// How much of the user's configuration a fork subprocess inherits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Isolation {
-    /// Full config: plugins, MCP servers, skills, CLAUDE.md all load, so the
-    /// fork's request prefix matches a normal session and reuses the prompt
-    /// cache. Recursion is prevented by the `FORKSAN_FORK` env guard, not by
-    /// stripping config.
-    #[default]
-    Open,
-    /// Stripped-down: no settings-derived hooks, no MCP servers, no project
-    /// settings. Fork sessions run bare (the pre-cache-economics behavior).
-    Hermetic,
-}
-
 /// Effective configuration after layering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Idle deadline for bare `idle` triggers (seconds). 0 disables them
-    /// (which also makes every session end count as a manual stop).
+    /// Idle deadline for bare `idle` triggers (seconds). 0 disables them.
     pub default_idle_deadline_secs: u64,
-    /// A session idle longer than this is closed by the boot sweep (seconds).
+    /// A session idle longer than this is closed by the session reaper.
     pub session_timeout_secs: u64,
     /// The daemon exits after this long with nothing to do (seconds).
     pub quiet_period_secs: u64,
-    /// Fork batch width after the leader ran alone.
-    pub concurrency: usize,
-    /// Kill a fork run after this long (seconds). Config key `run_timeout`
-    /// (alias `fork_timeout`).
-    pub fork_timeout_secs: u64,
-    /// The Claude Code binary to run forks with.
-    pub claude_bin: String,
-    /// Assumed model context window for `context_used`/`context_left`.
-    pub context_window: u64,
-    /// Per-model context window overrides.
-    pub models: BTreeMap<String, u64>,
-    /// Undelivered reports are dropped after this long (seconds).
-    pub report_ttl_secs: u64,
-    /// additionalContext budget per delivery (characters).
-    pub poll_budget_chars: usize,
+    /// After the first fork comes due for a parked session, wait this long
+    /// before answering so near-simultaneous forks batch into one wake
+    /// (seconds). 0 answers immediately.
+    pub wake_debounce_secs: u64,
     /// Default enable (whitelist) tag filter; a session's own filter (from
     /// the hook env vars) overrides it. `None` = unset.
     pub enable_tags: Option<Vec<String>>,
     /// Default disable (blocklist) tag filter; a session's own filter
     /// overrides it. `None` = unset.
     pub disable_tags: Option<Vec<String>>,
-    /// Per-tag shared throttle (seconds): a minimum gap between runs of any
+    /// Per-tag shared throttle (seconds): a minimum gap between wakes of any
     /// fork carrying that tag, across the project.
     pub tag_throttles: BTreeMap<String, u64>,
-    /// Default `--permission-mode` for fork subprocesses (`default`,
-    /// `acceptEdits`, or `bypassPermissions`); a fork's own `permission_mode`
-    /// overrides it. `None` = no flag.
-    pub permission_mode: Option<String>,
-    /// How much of the user's config a fork inherits (`open` = full, the
-    /// default; `hermetic` = stripped down).
-    pub isolation: Isolation,
 }
 
 impl Default for Config {
@@ -70,64 +43,42 @@ impl Default for Config {
             default_idle_deadline_secs: 600,
             session_timeout_secs: 12 * 3600,
             quiet_period_secs: 20 * 60,
-            concurrency: 4,
-            fork_timeout_secs: 600,
-            claude_bin: "claude".into(),
-            context_window: 200_000,
-            // Common override aliases pinned to their real windows, so the
-            // model-override window guard is right even when `context_window`
-            // is raised for a big default model. User `[models]` entries
-            // extend/override these.
-            models: BTreeMap::from([
-                ("sonnet".to_string(), 200_000),
-                ("haiku".to_string(), 200_000),
-                ("opus".to_string(), 200_000),
-            ]),
-            report_ttl_secs: 7 * 86400,
-            poll_budget_chars: 24_000,
+            wake_debounce_secs: 5,
             enable_tags: None,
             disable_tags: None,
             tag_throttles: BTreeMap::new(),
-            permission_mode: None,
-            isolation: Isolation::default(),
         }
     }
 }
 
-impl Config {
-    /// The context window for a model name, honoring per-model overrides.
-    pub fn window_for(&self, model: Option<&str>) -> u64 {
-        model
-            .and_then(|m| self.models.get(m).copied())
-            .unwrap_or(self.context_window)
-    }
-}
-
-/// Raw TOML shape; every key optional so layers can be sparse.
+/// Raw TOML shape; every key optional so layers can be sparse. Deprecated
+/// keys are still declared so their presence can be warned about.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawConfig {
     default_idle_deadline: Option<toml::Value>,
     session_timeout: Option<toml::Value>,
     quiet_period: Option<toml::Value>,
-    concurrency: Option<usize>,
-    fork_timeout: Option<toml::Value>,
-    run_timeout: Option<toml::Value>,
-    claude_bin: Option<String>,
-    context_window: Option<u64>,
-    #[serde(default)]
-    models: BTreeMap<String, u64>,
-    report_ttl: Option<toml::Value>,
-    poll_budget_chars: Option<usize>,
+    wake_debounce: Option<toml::Value>,
     enable_tags: Option<Vec<String>>,
     disable_tags: Option<Vec<String>>,
     #[serde(default)]
     tag_throttles: BTreeMap<String, toml::Value>,
-    permission_mode: Option<String>,
-    isolation: Option<String>,
+    // ---- deprecated since v0.5: accepted, warned, ignored ----
+    concurrency: Option<toml::Value>,
+    fork_timeout: Option<toml::Value>,
+    run_timeout: Option<toml::Value>,
+    claude_bin: Option<toml::Value>,
+    context_window: Option<toml::Value>,
+    #[serde(default)]
+    models: BTreeMap<String, toml::Value>,
+    report_ttl: Option<toml::Value>,
+    poll_budget_chars: Option<toml::Value>,
+    permission_mode: Option<toml::Value>,
+    isolation: Option<toml::Value>,
 }
 
 /// Keys ignored at project level (global-only concerns).
-const GLOBAL_ONLY: &[&str] = &["quiet_period", "claude_bin"];
+const GLOBAL_ONLY: &[&str] = &["quiet_period"];
 
 fn parse_toml_duration(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> Option<u64> {
     let parsed = match v {
@@ -159,34 +110,8 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     if let Some(s) = dur(&raw.quiet_period, "quiet_period") {
         cfg.quiet_period_secs = s;
     }
-    // `run_timeout` is the documented name for the fork-run kill timeout;
-    // `fork_timeout` remains an accepted alias. `run_timeout` wins if both
-    // appear in the same layer.
-    if let Some(s) = dur(&raw.fork_timeout, "fork_timeout") {
-        cfg.fork_timeout_secs = s;
-    }
-    if let Some(s) = dur(&raw.run_timeout, "run_timeout") {
-        cfg.fork_timeout_secs = s;
-    }
-    if let Some(s) = dur(&raw.report_ttl, "report_ttl") {
-        cfg.report_ttl_secs = s;
-    }
-    if let Some(n) = raw.concurrency {
-        cfg.concurrency = n.max(1);
-    }
-    if let Some(b) = raw.claude_bin {
-        if project_level {
-            warnings.push("'claude_bin' is global-only; ignoring project value".into());
-        } else {
-            cfg.claude_bin = b;
-        }
-    }
-    if let Some(n) = raw.context_window {
-        cfg.context_window = n;
-    }
-    cfg.models.extend(raw.models);
-    if let Some(n) = raw.poll_budget_chars {
-        cfg.poll_budget_chars = n;
+    if let Some(s) = dur(&raw.wake_debounce, "wake_debounce") {
+        cfg.wake_debounce_secs = s;
     }
     if let Some(v) = raw.enable_tags {
         cfg.enable_tags = Some(v);
@@ -194,31 +119,33 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     if let Some(v) = raw.disable_tags {
         cfg.disable_tags = Some(v);
     }
-    // Like `models`: per-key extend so a project layer overrides the home
-    // layer for the tags it names and inherits the rest.
+    // Like `models` once did: per-key extend so a project layer overrides the
+    // home layer for the tags it names and inherits the rest.
     for (tag, v) in raw.tag_throttles {
         let key = format!("tag_throttles.{tag}");
         if let Some(secs) = parse_toml_duration(&v, &key, warnings) {
             cfg.tag_throttles.insert(tag, secs);
         }
     }
-    if let Some(m) = raw.permission_mode {
-        match m.trim() {
-            "" => {}
-            "default" | "acceptEdits" | "bypassPermissions" => {
-                cfg.permission_mode = Some(m.trim().to_string());
-            }
-            other => warnings.push(format!("unknown permission_mode '{other}', ignoring")),
+
+    // Deprecated keys: warn once each, ignore the value.
+    let mut deprecated = |present: bool, key: &str| {
+        if present {
+            warnings.push(format!(
+                "'{key}' is no longer used since v0.5 (forks run as fork subagents), ignoring"
+            ));
         }
-    }
-    if let Some(v) = raw.isolation {
-        match v.trim() {
-            "" => {}
-            "open" => cfg.isolation = Isolation::Open,
-            "hermetic" => cfg.isolation = Isolation::Hermetic,
-            other => warnings.push(format!("unknown isolation '{other}', ignoring")),
-        }
-    }
+    };
+    deprecated(raw.concurrency.is_some(), "concurrency");
+    deprecated(raw.fork_timeout.is_some(), "fork_timeout");
+    deprecated(raw.run_timeout.is_some(), "run_timeout");
+    deprecated(raw.claude_bin.is_some(), "claude_bin");
+    deprecated(raw.context_window.is_some(), "context_window");
+    deprecated(!raw.models.is_empty(), "models");
+    deprecated(raw.report_ttl.is_some(), "report_ttl");
+    deprecated(raw.poll_budget_chars.is_some(), "poll_budget_chars");
+    deprecated(raw.permission_mode.is_some(), "permission_mode");
+    deprecated(raw.isolation.is_some(), "isolation");
 }
 
 fn load_layer(path: &Path, warnings: &mut Vec<String>) -> Option<RawConfig> {
@@ -369,25 +296,47 @@ mod tests {
         fs::create_dir_all(proj.join(".forksan")).unwrap();
         fs::write(
             home.join(".forksan/config.toml"),
-            "default_idle_deadline = \"5m\"\nquiet_period = \"30m\"\nclaude_bin = \"claude-x\"\n[models]\n\"m1\" = 100\n",
+            "default_idle_deadline = \"5m\"\nquiet_period = \"30m\"\n",
         )
         .unwrap();
         fs::write(
             proj.join(".forksan/config.toml"),
-            "default_idle_deadline = 120\nquiet_period = \"1h\"\nconcurrency = 2\n[models]\n\"m2\" = 200\n",
+            "default_idle_deadline = 120\nquiet_period = \"1h\"\n",
         )
         .unwrap();
 
         let (cfg, warnings) = load_config(Some(&proj), Some(&home));
         assert_eq!(cfg.default_idle_deadline_secs, 120);
         assert_eq!(cfg.quiet_period_secs, 1800); // project-level ignored
-        assert_eq!(cfg.claude_bin, "claude-x");
-        assert_eq!(cfg.concurrency, 2);
-        assert_eq!(cfg.window_for(Some("m1")), 100);
-        assert_eq!(cfg.window_for(Some("m2")), 200);
-        assert_eq!(cfg.window_for(Some("other")), 200_000);
-        assert_eq!(cfg.window_for(None), 200_000);
         assert!(warnings.iter().any(|w| w.contains("quiet_period")));
+    }
+
+    #[test]
+    fn deprecated_keys_warn_but_dont_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "claude_bin = \"claude-x\"\nconcurrency = 4\nrun_timeout = \"10m\"\nisolation = \"open\"\ncontext_window = 500000\n[models]\n\"m1\" = 100\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        // Nothing applied; all deprecated keys warned.
+        assert_eq!(cfg, Config::default());
+        for key in [
+            "claude_bin",
+            "concurrency",
+            "run_timeout",
+            "isolation",
+            "context_window",
+            "models",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(key)),
+                "missing warning for {key}"
+            );
+        }
     }
 
     #[test]
@@ -402,7 +351,6 @@ mod tests {
             "enable_tags = [\"home\"]\ndisable_tags = [\"noisy\"]\n",
         )
         .unwrap();
-        // Project overrides enable_tags but leaves disable_tags to the home layer.
         fs::write(
             proj.join(".forksan/config.toml"),
             "enable_tags = [\"ci\", \"review\"]\n",
@@ -414,11 +362,6 @@ mod tests {
             cfg.enable_tags,
             Some(vec!["ci".to_string(), "review".to_string()])
         );
-        assert_eq!(cfg.disable_tags, Some(vec!["noisy".to_string()]));
-
-        // Home-only when the project sets nothing.
-        let (cfg, _) = load_config(None, Some(&home));
-        assert_eq!(cfg.enable_tags, Some(vec!["home".to_string()]));
         assert_eq!(cfg.disable_tags, Some(vec!["noisy".to_string()]));
     }
 
@@ -434,7 +377,6 @@ mod tests {
             "[tag_throttles]\nci = \"1h\"\nreview = \"30m\"\n",
         )
         .unwrap();
-        // Project overrides `ci`, adds `docs`, and inherits `review`.
         fs::write(
             proj.join(".forksan/config.toml"),
             "[tag_throttles]\nci = 120\ndocs = \"10m\"\n",
@@ -449,101 +391,15 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_layers_and_validates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let proj = tmp.path().join("proj");
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-        fs::create_dir_all(proj.join(".forksan")).unwrap();
-        fs::write(
-            home.join(".forksan/config.toml"),
-            "permission_mode = \"acceptEdits\"\n",
-        )
-        .unwrap();
-        // Project overrides with a valid mode.
-        fs::write(
-            proj.join(".forksan/config.toml"),
-            "permission_mode = \"bypassPermissions\"\n",
-        )
-        .unwrap();
-        let (cfg, _) = load_config(Some(&proj), Some(&home));
-        assert_eq!(cfg.permission_mode.as_deref(), Some("bypassPermissions"));
-
-        // Home-only when the project sets nothing.
-        let (cfg, _) = load_config(None, Some(&home));
-        assert_eq!(cfg.permission_mode.as_deref(), Some("acceptEdits"));
-
-        // An unknown value warns and leaves it unset.
-        fs::write(
-            home.join(".forksan/config.toml"),
-            "permission_mode = \"pigeon\"\n",
-        )
-        .unwrap();
-        let (cfg, warnings) = load_config(None, Some(&home));
-        assert_eq!(cfg.permission_mode, None);
-        assert!(warnings.iter().any(|w| w.contains("permission_mode")));
-    }
-
-    #[test]
-    fn isolation_layers_and_validates() {
+    fn wake_debounce_parses_and_defaults() {
+        assert_eq!(Config::default().wake_debounce_secs, 5);
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         fs::create_dir_all(home.join(".forksan")).unwrap();
-
-        // Default is open.
-        assert_eq!(Config::default().isolation, Isolation::Open);
-
-        fs::write(
-            home.join(".forksan/config.toml"),
-            "isolation = \"hermetic\"\n",
-        )
-        .unwrap();
+        fs::write(home.join(".forksan/config.toml"), "wake_debounce = 0\n").unwrap();
         let (cfg, warnings) = load_config(None, Some(home));
-        assert_eq!(cfg.isolation, Isolation::Hermetic);
+        assert_eq!(cfg.wake_debounce_secs, 0);
         assert!(warnings.is_empty());
-
-        // Unknown values warn and keep the default.
-        fs::write(home.join(".forksan/config.toml"), "isolation = \"vault\"\n").unwrap();
-        let (cfg, warnings) = load_config(None, Some(home));
-        assert_eq!(cfg.isolation, Isolation::Open);
-        assert!(warnings.iter().any(|w| w.contains("isolation")));
-    }
-
-    #[test]
-    fn run_timeout_parses_and_aliases_fork_timeout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        fs::create_dir_all(home.join(".forksan")).unwrap();
-
-        // Default is unchanged at 600s.
-        assert_eq!(Config::default().fork_timeout_secs, 600);
-
-        fs::write(home.join(".forksan/config.toml"), "run_timeout = \"20m\"\n").unwrap();
-        let (cfg, warnings) = load_config(None, Some(home));
-        assert_eq!(cfg.fork_timeout_secs, 1200);
-        assert!(warnings.is_empty());
-
-        // The legacy `fork_timeout` alias still works.
-        fs::write(home.join(".forksan/config.toml"), "fork_timeout = 90\n").unwrap();
-        let (cfg, _) = load_config(None, Some(home));
-        assert_eq!(cfg.fork_timeout_secs, 90);
-    }
-
-    #[test]
-    fn default_models_map_pins_common_aliases() {
-        let cfg = Config::default();
-        assert_eq!(cfg.window_for(Some("sonnet")), 200_000);
-        assert_eq!(cfg.window_for(Some("haiku")), 200_000);
-        // A raised default window must not lift the pinned aliases.
-        let mut cfg = Config {
-            context_window: 1_000_000,
-            ..Config::default()
-        };
-        assert_eq!(cfg.window_for(Some("sonnet")), 200_000);
-        assert_eq!(cfg.window_for(Some("unknown-big")), 1_000_000);
-        // User entries still override the pins.
-        cfg.models.insert("sonnet".to_string(), 500_000);
-        assert_eq!(cfg.window_for(Some("sonnet")), 500_000);
     }
 
     #[test]
@@ -561,12 +417,11 @@ mod tests {
         fs::create_dir_all(home.join(".forksan")).unwrap();
         fs::write(
             home.join(".forksan/config.toml"),
-            "default_idle_deadline = \"soon\"\nconcurrency = 0\n",
+            "default_idle_deadline = \"soon\"\n",
         )
         .unwrap();
         let (cfg, warnings) = load_config(None, Some(home));
         assert_eq!(cfg.default_idle_deadline_secs, 600);
-        assert_eq!(cfg.concurrency, 1); // clamped
         assert_eq!(warnings.len(), 1);
     }
 }

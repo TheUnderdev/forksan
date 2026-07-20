@@ -1,8 +1,5 @@
 mod daemon;
-mod gates;
-mod idle;
 mod planner;
-mod runner;
 mod server;
 mod sweep;
 mod transcript;
@@ -93,9 +90,9 @@ async fn async_main(paths: Paths, store: Store) {
 
     let daemon = Daemon::new(paths, store);
 
-    // Service what a dead daemon still owed, in the background.
+    // Close sessions that timed out (crashed without a SessionEnd).
     let sweeper = daemon.clone();
-    tokio::spawn(async move { sweep::boot_sweep(&sweeper).await });
+    tokio::spawn(async move { sweep::session_reaper(sweeper).await });
 
     let reaper = daemon.clone();
     tokio::spawn(async move { reaper.quiet_reaper().await });
