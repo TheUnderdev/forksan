@@ -150,13 +150,21 @@ Claude Code ──hooks──▶ forksan (CLI) ──unix socket──▶ forksa
   SessionEnd) to a per-user daemon, auto-spawned on demand and self-terminating when idle.
 - A fork run is a headless `claude -p --resume <your session> --fork-session` — a *copy* of your
   session's context; your real session is never touched. By default a fork loads your **full
-  configuration** (plugins, MCP servers, skills, `CLAUDE.md`) so its request prefix matches a
-  normal session and reuses the **prompt cache** — the same context is far cheaper to re-send.
-  Forks therefore *do* fire your other (non-forksan) hooks and load MCP servers. Recursion is
+  configuration** (plugins, MCP servers, skills, `CLAUDE.md`) so its request prefix matches the
+  parent as closely as `claude` allows and reuses the **prompt cache** wherever possible.
+  Measured cache behavior (byte-level request diffing): a fork of a **headless/print-mode**
+  parent reuses ~100% of the parent's cached prefix; a fork of an **interactive** parent cannot
+  reuse the parent's cache at all — interactive sessions load a larger tool set than `-p` mode
+  (interactive-only tools lead the prefix), which is not controllable from the CLI. Consecutive
+  forks of the *same* session always share their own full-config prefix (1-hour cache TTL), so
+  repeated fork moments stay cheap either way. For big sessions triggering expensive-model
+  forks, a `model:` override on the fork is often the bigger cost lever.
+  Forks *do* fire your other (non-forksan) hooks and load MCP servers. Recursion is
   prevented not by stripping config but by an env guard: every fork subprocess carries
   `FORKSAN_FORK`, and forksan's own hooks exit immediately when they see it, so a fork can't
   trigger forks. Set `isolation = "hermetic"` (see [Configuration](#configuration)) to run bare
-  forks instead (no plugins/MCP/hooks/`CLAUDE.md`).
+  forks instead (no plugins/MCP/hooks/`CLAUDE.md`) — note this *changes* the request prefix
+  (settings-injected context differs), so hermetic forks never share cache with normal runs.
 - Reports come back as `additionalContext` on your next prompt, formatted as small
   `source: forksan` blocks.
 - A boot sweep on daemon start services anything a dead daemon still owed (missed idle forks,
