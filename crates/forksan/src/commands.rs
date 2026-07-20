@@ -122,6 +122,9 @@ pub fn list_forks(paths: &Paths, project: Option<std::path::PathBuf>) -> Result<
         if !f.after.is_empty() {
             details.push(format!("after: {}", f.after.join(", ")));
         }
+        if !f.tags.is_empty() {
+            details.push(format!("tags: {}", f.tags.join(", ")));
+        }
         if f.overlap {
             details.push("overlap allowed".into());
         }

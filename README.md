@@ -68,6 +68,7 @@ open questions, and next steps. Keep it under 200 lines.
 | `after` | fork name(s): `journal`, `[a, b]`, or maps `{fork: name, context: parent\|fork}` | — |
 | `overlap` | `true` to allow two runs of this fork at once | `false` |
 | `model` | model override for the fork run | session default |
+| `tags` | labels for the enable/disable filter: `ci`, `[ci, review]` | — |
 
 Moments for `run_on`:
 
@@ -144,10 +145,36 @@ claude_bin = "claude"          # global only
 context_window = 200000        # for context_used / context_left
 report_ttl = "7d"              # drop undelivered reports after this
 poll_budget_chars = 24000      # max report chars injected per turn
+enable_tags = ["ci"]           # default tag whitelist (see below)
+disable_tags = ["noisy"]       # default tag blocklist (see below)
 
 [models]                       # per-model context windows
 "some-model-id" = 500000
 ```
+
+### Tag filtering
+
+Forks can carry `tags:` in their frontmatter, and a session can then narrow which
+forks fire. The filter has two sets, an **enable** (whitelist) and a **disable**
+(blocklist), applied per fork at selection time:
+
+- If any of a fork's tags is in the disable set, the fork is skipped — **disable
+  wins** over enable.
+- If the enable set is present and non-empty, a fork runs only if at least one of
+  its tags is in it — so **untagged forks are excluded by a whitelist**.
+- With neither set configured, every fork runs (fully backward compatible).
+
+Two sources feed the filter, per key:
+
+- **Per session** — the environment variables `FORKSAN_ENABLE_TAGS` and
+  `FORKSAN_DISABLE_TAGS` (comma-separated), read from the Claude Code process env
+  by the hook and carried with the session. Set them per project/shell to scope a
+  session (`FORKSAN_DISABLE_TAGS=noisy claude`).
+- **Defaults** — the `enable_tags` / `disable_tags` config keys above (project
+  layer over home layer). A session's env value overrides the config default for
+  that key.
+
+Manual runs (`forksan run <name>`) deliberately bypass the filter.
 
 ## Costs, caveats
 

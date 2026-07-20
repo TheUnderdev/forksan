@@ -14,7 +14,19 @@ use crate::{truncate_chars, REPORT_MAX_CHARS};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+
+/// Split a comma-joined tag column back into a list (trimmed, empties
+/// dropped). `NULL` (unset) stays `None`; a stored value always yields a
+/// (possibly empty) list.
+fn split_tags(s: Option<String>) -> Option<Vec<String>> {
+    s.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    })
+}
 
 /// A tracked Claude Code session.
 #[derive(Debug, Clone)]
@@ -30,6 +42,10 @@ pub struct SessionRow {
     pub prompt_tokens: Option<u64>,
     pub model: Option<String>,
     pub created_at: i64,
+    /// Per-session enable (whitelist) tag filter; `None` = unset.
+    pub enable_tags: Option<Vec<String>>,
+    /// Per-session disable (blocklist) tag filter; `None` = unset.
+    pub disable_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +172,18 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS idx_runs_session ON fork_runs (session_id);
                  COMMIT;",
             )?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        if version < 2 {
+            // Per-session tag filter (comma-joined; NULL = unset). Added by
+            // ALTER so both fresh (post-v1 CREATE) and upgraded DBs converge.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN enable_tags TEXT;
+                 ALTER TABLE sessions ADD COLUMN disable_tags TEXT;
+                 COMMIT;",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
 
@@ -172,17 +198,24 @@ impl Store {
         cwd: &Path,
         transcript_path: Option<&Path>,
         model: Option<&str>,
+        enable_tags: Option<&str>,
+        disable_tags: Option<&str>,
         now: i64,
     ) -> rusqlite::Result<()> {
+        // The per-session tag filter always reflects the latest event (the
+        // hook re-sends it on every frame), so it overwrites rather than
+        // coalesces — a cleared env var (NULL) legitimately clears it.
         self.conn.execute(
             "INSERT INTO sessions (session_id, project_root, cwd, transcript_path, status,
-                                   last_activity, created_at, model)
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6)
+                                   last_activity, created_at, model, enable_tags, disable_tags)
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_id) DO UPDATE SET
                project_root = excluded.project_root,
                cwd = excluded.cwd,
                transcript_path = COALESCE(excluded.transcript_path, transcript_path),
                model = COALESCE(excluded.model, model),
+               enable_tags = excluded.enable_tags,
+               disable_tags = excluded.disable_tags,
                status = 'open',
                last_activity = excluded.last_activity",
             params![
@@ -192,6 +225,8 @@ impl Store {
                 transcript_path.map(|p| p.to_string_lossy().into_owned()),
                 now,
                 model,
+                enable_tags,
+                disable_tags,
             ],
         )?;
         Ok(())
@@ -201,7 +236,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at
+                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
+                        enable_tags, disable_tags
                  FROM sessions WHERE session_id = ?1",
                 params![session_id],
                 Self::row_to_session,
@@ -226,13 +262,16 @@ impl Store {
             prompt_tokens: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
             model: row.get(9)?,
             created_at: row.get(10)?,
+            enable_tags: split_tags(row.get::<_, Option<String>>(11)?),
+            disable_tags: split_tags(row.get::<_, Option<String>>(12)?),
         })
     }
 
     pub fn list_open_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                    forks_ran_at, transcript_offset, prompt_tokens, model, created_at
+                    forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
+                    enable_tags, disable_tags
              FROM sessions WHERE status = 'open' ORDER BY last_activity DESC",
         )?;
         let rows = stmt.query_map([], Self::row_to_session)?;
@@ -247,7 +286,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT session_id, project_root, cwd, transcript_path, status, last_activity,
-                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at
+                        forks_ran_at, transcript_offset, prompt_tokens, model, created_at,
+                        enable_tags, disable_tags
                  FROM sessions WHERE status = 'open' AND project_root = ?1
                  ORDER BY last_activity DESC LIMIT 1",
                 params![project_root.to_string_lossy()],
@@ -607,8 +647,17 @@ mod tests {
     }
 
     fn seed_session(s: &Store, sid: &str, root: &str, now: i64) {
-        s.upsert_session(sid, Path::new(root), Path::new(root), None, None, now)
-            .unwrap();
+        s.upsert_session(
+            sid,
+            Path::new(root),
+            Path::new(root),
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -872,6 +921,44 @@ mod tests {
             s.fork_session_ids_before(1000).unwrap(),
             vec!["fork-sid".to_string()]
         );
+    }
+
+    #[test]
+    fn tag_filter_persists_and_latest_event_wins() {
+        let s = store();
+        s.upsert_session(
+            "a",
+            Path::new("/p"),
+            Path::new("/p"),
+            None,
+            None,
+            Some("ci,review"),
+            Some("noisy"),
+            100,
+        )
+        .unwrap();
+        let row = s.get_session("a").unwrap().unwrap();
+        assert_eq!(
+            row.enable_tags,
+            Some(vec!["ci".to_string(), "review".to_string()])
+        );
+        assert_eq!(row.disable_tags, Some(vec!["noisy".to_string()]));
+
+        // A later event with no filter clears both (env unset => NULL).
+        s.upsert_session(
+            "a",
+            Path::new("/p"),
+            Path::new("/p"),
+            None,
+            None,
+            None,
+            None,
+            101,
+        )
+        .unwrap();
+        let row = s.get_session("a").unwrap().unwrap();
+        assert_eq!(row.enable_tags, None);
+        assert_eq!(row.disable_tags, None);
     }
 
     #[test]

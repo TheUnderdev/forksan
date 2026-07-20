@@ -148,6 +148,8 @@ impl Harness {
             trigger: None,
             reason: None,
             model: None,
+            enable_tags: None,
+            disable_tags: None,
             wait: WaitMode::None,
         }
     }
@@ -257,6 +259,81 @@ fn idle_fork_fires_and_report_delivers_next_turn() {
 
     // Reports deliver exactly once.
     assert!(h.poll("s1").is_empty());
+}
+
+#[test]
+fn disable_tag_filters_fork_but_untagged_runs() {
+    let mut h = Harness::new("1s");
+    h.write_fork(
+        "tagged.md",
+        "---\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED WORK",
+    );
+    h.write_fork("plain.md", "---\nrun_on: [idle]\n---\nPLAIN WORK");
+    h.start_daemon();
+
+    let mut start_ev = h.event(EventKind::SessionStart, "s1");
+    start_ev.disable_tags = Some(vec!["ci".into()]);
+    assert_ack(h.send_event(start_ev));
+    let mut stop_ev = h.event(EventKind::Stop, "s1");
+    stop_ev.disable_tags = Some(vec!["ci".into()]);
+    assert_ack(h.send_event(stop_ev));
+
+    // The untagged fork runs at the 1s idle deadline.
+    let start = Instant::now();
+    loop {
+        if h.stub_prompts().iter().any(|p| p.contains("PLAIN WORK")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "untagged fork never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Both forks share the idle moment, so the tagged one was already
+    // evaluated (and skipped) by now; a short grace confirms it stays out.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        h.stub_prompts().iter().all(|p| !p.contains("TAGGED WORK")),
+        "disabled tagged fork ran anyway"
+    );
+}
+
+#[test]
+fn enable_list_excludes_untagged_fork() {
+    let mut h = Harness::new("1s");
+    h.write_fork(
+        "tagged.md",
+        "---\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED WORK",
+    );
+    h.write_fork("plain.md", "---\nrun_on: [idle]\n---\nPLAIN WORK");
+    h.start_daemon();
+
+    let mut start_ev = h.event(EventKind::SessionStart, "s1");
+    start_ev.enable_tags = Some(vec!["ci".into()]);
+    assert_ack(h.send_event(start_ev));
+    let mut stop_ev = h.event(EventKind::Stop, "s1");
+    stop_ev.enable_tags = Some(vec!["ci".into()]);
+    assert_ack(h.send_event(stop_ev));
+
+    // The whitelisted tagged fork runs.
+    let start = Instant::now();
+    loop {
+        if h.stub_prompts().iter().any(|p| p.contains("TAGGED WORK")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "whitelisted fork never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    // The untagged fork is excluded by the whitelist.
+    assert!(
+        h.stub_prompts().iter().all(|p| !p.contains("PLAIN WORK")),
+        "untagged fork ran despite an enable whitelist"
+    );
 }
 
 #[test]

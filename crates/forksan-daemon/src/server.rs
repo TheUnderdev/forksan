@@ -131,6 +131,7 @@ async fn dispatch(daemon: &Arc<Daemon>, body: RequestBody) -> ResponseBody {
                     after: e.parsed.def.after.iter().map(|a| a.fork.clone()).collect(),
                     overlap: e.parsed.def.overlap,
                     model: e.parsed.def.model.clone(),
+                    tags: e.parsed.def.tags.clone(),
                     warnings: e
                         .parsed
                         .warnings

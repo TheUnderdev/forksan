@@ -67,6 +67,12 @@ pub struct Event {
     /// context-window lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-session enable (whitelist) tag filter, from `FORKSAN_ENABLE_TAGS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_tags: Option<Vec<String>>,
+    /// Per-session disable (blocklist) tag filter, from `FORKSAN_DISABLE_TAGS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_tags: Option<Vec<String>>,
     /// What the hook wants to wait for before the daemon acks.
     #[serde(default)]
     pub wait: WaitMode,
@@ -190,6 +196,8 @@ pub struct ForkInfo {
     #[serde(default)]
     pub overlap: bool,
     pub model: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -219,6 +227,8 @@ mod tests {
                 trigger: Some("auto".into()),
                 reason: None,
                 model: None,
+                enable_tags: None,
+                disable_tags: None,
                 wait: WaitMode::ForksSpawned,
             }),
         };

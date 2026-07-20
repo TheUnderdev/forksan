@@ -31,6 +31,12 @@ pub struct Config {
     pub report_ttl_secs: u64,
     /// additionalContext budget per delivery (characters).
     pub poll_budget_chars: usize,
+    /// Default enable (whitelist) tag filter; a session's own filter (from
+    /// the hook env vars) overrides it. `None` = unset.
+    pub enable_tags: Option<Vec<String>>,
+    /// Default disable (blocklist) tag filter; a session's own filter
+    /// overrides it. `None` = unset.
+    pub disable_tags: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -46,6 +52,8 @@ impl Default for Config {
             models: BTreeMap::new(),
             report_ttl_secs: 7 * 86400,
             poll_budget_chars: 24_000,
+            enable_tags: None,
+            disable_tags: None,
         }
     }
 }
@@ -73,6 +81,8 @@ struct RawConfig {
     models: BTreeMap<String, u64>,
     report_ttl: Option<toml::Value>,
     poll_budget_chars: Option<usize>,
+    enable_tags: Option<Vec<String>>,
+    disable_tags: Option<Vec<String>>,
 }
 
 /// Keys ignored at project level (global-only concerns).
@@ -130,6 +140,12 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
     cfg.models.extend(raw.models);
     if let Some(n) = raw.poll_budget_chars {
         cfg.poll_budget_chars = n;
+    }
+    if let Some(v) = raw.enable_tags {
+        cfg.enable_tags = Some(v);
+    }
+    if let Some(v) = raw.disable_tags {
+        cfg.disable_tags = Some(v);
     }
 }
 
@@ -300,6 +316,38 @@ mod tests {
         assert_eq!(cfg.window_for(Some("other")), 200_000);
         assert_eq!(cfg.window_for(None), 200_000);
         assert!(warnings.iter().any(|w| w.contains("quiet_period")));
+    }
+
+    #[test]
+    fn tag_filter_keys_layer_project_over_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+        fs::create_dir_all(proj.join(".forksan")).unwrap();
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "enable_tags = [\"home\"]\ndisable_tags = [\"noisy\"]\n",
+        )
+        .unwrap();
+        // Project overrides enable_tags but leaves disable_tags to the home layer.
+        fs::write(
+            proj.join(".forksan/config.toml"),
+            "enable_tags = [\"ci\", \"review\"]\n",
+        )
+        .unwrap();
+
+        let (cfg, _) = load_config(Some(&proj), Some(&home));
+        assert_eq!(
+            cfg.enable_tags,
+            Some(vec!["ci".to_string(), "review".to_string()])
+        );
+        assert_eq!(cfg.disable_tags, Some(vec!["noisy".to_string()]));
+
+        // Home-only when the project sets nothing.
+        let (cfg, _) = load_config(None, Some(&home));
+        assert_eq!(cfg.enable_tags, Some(vec!["home".to_string()]));
+        assert_eq!(cfg.disable_tags, Some(vec!["noisy".to_string()]));
     }
 
     #[test]

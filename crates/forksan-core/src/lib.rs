@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod schedule;
 pub mod store;
+pub mod tags;
 
 /// Wire/CLI/daemon protocol version. Bump only on breaking frame changes;
 /// the `shutdown` frame shape is frozen forever at proto 1.

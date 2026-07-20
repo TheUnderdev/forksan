@@ -71,6 +71,10 @@ impl Daemon {
     pub async fn handle_event(self: &Arc<Self>, ev: Event) -> ResponseBody {
         self.touch_busy();
         let t = now();
+        // The per-session tag filter rides on every event; persist it
+        // comma-joined so the latest event's values win on the session row.
+        let enable_tags = ev.enable_tags.as_ref().map(|v| v.join(","));
+        let disable_tags = ev.disable_tags.as_ref().map(|v| v.join(","));
         match ev.event {
             EventKind::SessionStart => {
                 {
@@ -81,6 +85,8 @@ impl Daemon {
                         &ev.cwd,
                         ev.transcript_path.as_deref(),
                         ev.model.as_deref(),
+                        enable_tags.as_deref(),
+                        disable_tags.as_deref(),
                         t,
                     );
                 }
@@ -114,6 +120,8 @@ impl Daemon {
                         &ev.cwd,
                         ev.transcript_path.as_deref(),
                         ev.model.as_deref(),
+                        enable_tags.as_deref(),
+                        disable_tags.as_deref(),
                         t,
                     );
                     let _ = store.set_last_activity(&ev.session_id, t);
@@ -138,6 +146,8 @@ impl Daemon {
                         &ev.cwd,
                         ev.transcript_path.as_deref(),
                         ev.model.as_deref(),
+                        enable_tags.as_deref(),
+                        disable_tags.as_deref(),
                         t,
                     );
                     let _ = store.set_last_activity(&ev.session_id, t);

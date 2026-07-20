@@ -1,7 +1,7 @@
 //! The fork definition format: a markdown file with YAML frontmatter.
 //!
 //! Top-level keys only (`description`, `run_on`, `delivery`, `throttle`,
-//! `after`, `overlap`, `model`); unknown keys are ignored for forward
+//! `after`, `overlap`, `model`, `tags`); unknown keys are ignored for forward
 //! compatibility, and invalid values warn and fall back rather than dropping
 //! the fork. There is deliberately no RAG surface in this format.
 
@@ -30,6 +30,9 @@ pub struct ForkDef {
     pub overlap: bool,
     /// Optional model override for the fork run.
     pub model: Option<String>,
+    /// Free-form tags used by the per-session enable/disable filter. Empty
+    /// when unset.
+    pub tags: Vec<String>,
 }
 
 impl Default for ForkDef {
@@ -42,6 +45,7 @@ impl Default for ForkDef {
             after: Vec::new(),
             overlap: false,
             model: None,
+            tags: Vec::new(),
         }
     }
 }
@@ -289,6 +293,40 @@ fn parse_after(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) ->
     out
 }
 
+/// Parse the `tags` value: a scalar string (comma-split) or a list of
+/// strings (each still comma-split for convenience). Entries are trimmed,
+/// empties dropped, and duplicates removed with the first occurrence kept.
+/// Non-string entries warn and are skipped; the fork stays valid.
+fn parse_tags(v: &serde_yaml::Value, name: &str, warnings: &mut Vec<String>) -> Vec<String> {
+    fn push_split(s: &str, out: &mut Vec<String>) {
+        for piece in s.split(',') {
+            let t = piece.trim();
+            if !t.is_empty() && !out.iter().any(|e| e == t) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    match v {
+        serde_yaml::Value::String(s) => push_split(s, &mut out),
+        serde_yaml::Value::Sequence(seq) => {
+            for entry in seq {
+                match entry {
+                    serde_yaml::Value::String(s) => push_split(s, &mut out),
+                    _ => warnings.push(format!(
+                        "fork '{name}': tags entry is not a string, skipping"
+                    )),
+                }
+            }
+        }
+        serde_yaml::Value::Null => {}
+        _ => warnings.push(format!(
+            "fork '{name}': tags must be a string or a list of strings, ignoring"
+        )),
+    }
+    out
+}
+
 #[derive(Deserialize, Default)]
 struct RawFork {
     #[serde(default)]
@@ -305,6 +343,8 @@ struct RawFork {
     overlap: Option<serde_yaml::Value>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    tags: Option<serde_yaml::Value>,
     // Recognized-and-rejected: the format has no RAG surface.
     #[serde(default)]
     rag: Option<serde_yaml::Value>,
@@ -437,6 +477,12 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
         }
     };
 
+    let tags = raw
+        .tags
+        .as_ref()
+        .map(|v| parse_tags(v, name, &mut warnings))
+        .unwrap_or_default();
+
     for w in &warnings {
         tracing::warn!(fork = name, "{w}");
     }
@@ -450,6 +496,7 @@ pub fn parse_fork_file(name: &str, content: &str) -> Option<ParsedFork> {
             after,
             overlap,
             model: raw.model.filter(|m| !m.trim().is_empty()),
+            tags,
         },
         body: body.to_string(),
         warnings,
@@ -690,6 +737,51 @@ mod tests {
         let p = parse("---\nfuture_key: whatever\ndescription: d\n---\nb");
         assert!(p.warnings.is_empty());
         assert_eq!(p.def.description.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn tags_as_list() {
+        let p = parse("---\ntags: [ci, review]\n---\n");
+        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn tags_as_scalar() {
+        let p = parse("---\ntags: ci\n---\n");
+        assert_eq!(p.def.tags, vec!["ci".to_string()]);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn tags_scalar_with_commas_is_split() {
+        let p = parse("---\ntags: ci, review ,docs\n---\n");
+        assert_eq!(
+            p.def.tags,
+            vec!["ci".to_string(), "review".to_string(), "docs".to_string()]
+        );
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn tags_non_string_entries_warn_and_skip() {
+        let p = parse("---\ntags: [ci, 42, review]\n---\n");
+        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
+        assert_eq!(p.warnings.len(), 1);
+    }
+
+    #[test]
+    fn tags_absent_is_empty() {
+        let p = parse("---\ndescription: d\n---\n");
+        assert!(p.def.tags.is_empty());
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn tags_trimmed_and_deduped() {
+        let p = parse("---\ntags: [ci, ci , '  review  ', '']\n---\n");
+        assert_eq!(p.def.tags, vec!["ci".to_string(), "review".to_string()]);
+        assert!(p.warnings.is_empty());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The selection pipeline and plan execution for one set of fork moments.
 //!
 //! Pipeline (order matters): refresh discovery → queue
-//! roster → live re-read each rostered fork → match moments → skip-ran-after
+//! roster → live re-read each rostered fork → tag filter (per-session
+//! enable/disable, falling back to config) → match moments → skip-ran-after
 //! guard (boot sweep) → throttle → context/boot latch → dependency
 //! resolution → execution (a readiness-counted DAG: each fork runs once all
 //! its `after` dependencies finished, receiving their reports; the first
@@ -13,6 +14,7 @@ use crate::runner::{run_one_fork, Predecessor, SelectedFork};
 use forksan_core::frontmatter::parse_fork_file;
 use forksan_core::moments::{match_moments, ForkMoment};
 use forksan_core::schedule::resolve_deps;
+use forksan_core::tags::tags_allowed;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -61,6 +63,17 @@ pub async fn run_moments(
         let store = daemon.store.lock().unwrap();
         store.roster(session_id).unwrap_or_default()
     };
+    // Effective tag filter for this session: the session's own values (from
+    // the hook env) if set, else the config defaults.
+    let effective_enable = session
+        .enable_tags
+        .as_deref()
+        .or(cfg.enable_tags.as_deref());
+    let effective_disable = session
+        .disable_tags
+        .as_deref()
+        .or(cfg.disable_tags.as_deref());
+
     let mut selected: Vec<SelectedFork> = Vec::new();
     let t = now();
     for entry in roster {
@@ -71,6 +84,10 @@ pub async fn run_moments(
         let Some(parsed) = parse_fork_file(&entry.fork_name, &content) else {
             continue;
         };
+        // Per-session enable/disable tag filter (manual runs bypass this).
+        if !tags_allowed(&parsed.def.tags, effective_enable, effective_disable) {
+            continue;
+        }
         let Some(trigger) = match_moments(&parsed.def, moments, cfg.default_idle_deadline_secs)
         else {
             continue;

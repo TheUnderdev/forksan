@@ -156,6 +156,48 @@ fn full_hook_cycle_delivers_report_via_additional_context() {
 }
 
 #[test]
+fn disable_tags_env_filters_fork() {
+    let env = Env::new("1s");
+    std::fs::write(
+        env.project.join(".forksan/forks/tagged.md"),
+        "---\nrun_on: [idle]\ntags: [ci]\n---\nTAGGED BODY",
+    )
+    .unwrap();
+
+    // The hook inherits FORKSAN_DISABLE_TAGS=ci from the Claude Code env and
+    // carries it on the wire; the tagged fork must be filtered out.
+    let run_hook = |event: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+            .args(["hook", event])
+            .env("FORKSAN_HOME", &env.home)
+            .env("FORKSAN_SOCKET", &env.socket)
+            .env("STUB_DIR", &env.stub_dir)
+            .env("FORKSAN_DISABLE_TAGS", "ci")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(env.hook_input("s1").to_string().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+
+    run_hook("session-start");
+    run_hook("stop");
+    // Well past the 1s idle deadline: the disabled fork must not have run.
+    std::thread::sleep(Duration::from_millis(1800));
+    assert!(
+        !env.stub_ran(),
+        "disabled fork ran despite FORKSAN_DISABLE_TAGS"
+    );
+}
+
+#[test]
 fn concurrent_hooks_race_to_one_daemon() {
     let env = Env::new("1h");
     // Several session-starts at once: exactly one daemon must win.

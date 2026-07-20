@@ -56,6 +56,10 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
     let root = project_root(&cwd);
 
+    // Per-session tag filter, inherited from the Claude Code process env.
+    let enable_tags = tags_from_env("FORKSAN_ENABLE_TAGS");
+    let disable_tags = tags_from_env("FORKSAN_DISABLE_TAGS");
+
     let event = |ev: EventKind, wait: WaitMode| Event {
         event: ev,
         session_id: input.session_id.clone(),
@@ -66,6 +70,8 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         trigger: input.trigger.clone(),
         reason: input.reason.clone(),
         model: input.model.clone(),
+        enable_tags: enable_tags.clone(),
+        disable_tags: disable_tags.clone(),
         wait,
     };
 
@@ -123,6 +129,25 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// Read a comma-separated tag env var into a normalized list (trimmed,
+/// empties dropped, deduped). An unset or all-empty value yields `None` so the
+/// daemon falls back to the config default.
+fn tags_from_env(var: &str) -> Option<Vec<String>> {
+    let raw = std::env::var(var).ok()?;
+    let mut out: Vec<String> = Vec::new();
+    for piece in raw.split(',') {
+        let t = piece.trim();
+        if !t.is_empty() && !out.iter().any(|e| e == t) {
+            out.push(t.to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn poll_budget(paths: &Paths, root: &std::path::Path) -> usize {
