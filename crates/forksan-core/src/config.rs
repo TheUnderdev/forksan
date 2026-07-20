@@ -7,6 +7,20 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// How much of the user's configuration a fork subprocess inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// Full config: plugins, MCP servers, skills, CLAUDE.md all load, so the
+    /// fork's request prefix matches a normal session and reuses the prompt
+    /// cache. Recursion is prevented by the `FORKSAN_FORK` env guard, not by
+    /// stripping config.
+    #[default]
+    Open,
+    /// Stripped-down: no settings-derived hooks, no MCP servers, no project
+    /// settings. Fork sessions run bare (the pre-cache-economics behavior).
+    Hermetic,
+}
+
 /// Effective configuration after layering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -44,6 +58,9 @@ pub struct Config {
     /// `acceptEdits`, or `bypassPermissions`); a fork's own `permission_mode`
     /// overrides it. `None` = no flag.
     pub permission_mode: Option<String>,
+    /// How much of the user's config a fork inherits (`open` = full, the
+    /// default; `hermetic` = stripped down).
+    pub isolation: Isolation,
 }
 
 impl Default for Config {
@@ -63,6 +80,7 @@ impl Default for Config {
             disable_tags: None,
             tag_throttles: BTreeMap::new(),
             permission_mode: None,
+            isolation: Isolation::default(),
         }
     }
 }
@@ -95,6 +113,7 @@ struct RawConfig {
     #[serde(default)]
     tag_throttles: BTreeMap<String, toml::Value>,
     permission_mode: Option<String>,
+    isolation: Option<String>,
 }
 
 /// Keys ignored at project level (global-only concerns).
@@ -174,6 +193,14 @@ fn apply_layer(cfg: &mut Config, raw: RawConfig, project_level: bool, warnings: 
                 cfg.permission_mode = Some(m.trim().to_string());
             }
             other => warnings.push(format!("unknown permission_mode '{other}', ignoring")),
+        }
+    }
+    if let Some(v) = raw.isolation {
+        match v.trim() {
+            "" => {}
+            "open" => cfg.isolation = Isolation::Open,
+            "hermetic" => cfg.isolation = Isolation::Hermetic,
+            other => warnings.push(format!("unknown isolation '{other}', ignoring")),
         }
     }
 }
@@ -439,6 +466,31 @@ mod tests {
         let (cfg, warnings) = load_config(None, Some(&home));
         assert_eq!(cfg.permission_mode, None);
         assert!(warnings.iter().any(|w| w.contains("permission_mode")));
+    }
+
+    #[test]
+    fn isolation_layers_and_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".forksan")).unwrap();
+
+        // Default is open.
+        assert_eq!(Config::default().isolation, Isolation::Open);
+
+        fs::write(
+            home.join(".forksan/config.toml"),
+            "isolation = \"hermetic\"\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert_eq!(cfg.isolation, Isolation::Hermetic);
+        assert!(warnings.is_empty());
+
+        // Unknown values warn and keep the default.
+        fs::write(home.join(".forksan/config.toml"), "isolation = \"vault\"\n").unwrap();
+        let (cfg, warnings) = load_config(None, Some(home));
+        assert_eq!(cfg.isolation, Isolation::Open);
+        assert!(warnings.iter().any(|w| w.contains("isolation")));
     }
 
     #[test]

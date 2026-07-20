@@ -149,8 +149,14 @@ Claude Code ──hooks──▶ forksan (CLI) ──unix socket──▶ forksa
 - A tiny hook shim forwards lifecycle events (SessionStart, UserPromptSubmit, Stop, PreCompact,
   SessionEnd) to a per-user daemon, auto-spawned on demand and self-terminating when idle.
 - A fork run is a headless `claude -p --resume <your session> --fork-session` — a *copy* of your
-  session's context; your real session is never touched. Hooks, plugins, and MCP servers are
-  disabled inside forks, so forks can't recursively trigger forks.
+  session's context; your real session is never touched. By default a fork loads your **full
+  configuration** (plugins, MCP servers, skills, `CLAUDE.md`) so its request prefix matches a
+  normal session and reuses the **prompt cache** — the same context is far cheaper to re-send.
+  Forks therefore *do* fire your other (non-forksan) hooks and load MCP servers. Recursion is
+  prevented not by stripping config but by an env guard: every fork subprocess carries
+  `FORKSAN_FORK`, and forksan's own hooks exit immediately when they see it, so a fork can't
+  trigger forks. Set `isolation = "hermetic"` (see [Configuration](#configuration)) to run bare
+  forks instead (no plugins/MCP/hooks/`CLAUDE.md`).
 - Reports come back as `additionalContext` on your next prompt, formatted as small
   `source: forksan` blocks.
 - A boot sweep on daemon start services anything a dead daemon still owed (missed idle forks,
@@ -185,10 +191,18 @@ poll_budget_chars = 24000      # max report chars injected per turn
 enable_tags = ["ci"]           # default tag whitelist (see below)
 disable_tags = ["noisy"]       # default tag blocklist (see below)
 permission_mode = "acceptEdits" # default fork --permission-mode; a fork's own key wins
+isolation = "open"             # "open" (full config, cache reuse) | "hermetic" (bare forks)
 
 [models]                       # per-model context windows
 "some-model-id" = 500000
 ```
+
+`isolation` controls how much of your setup a fork inherits. `open` (the default) loads your
+full config so fork requests share your session's shape and reuse the prompt cache; forks then
+fire your other hooks and load MCP servers, and recursion is held off by the `FORKSAN_FORK`
+env guard. `hermetic` strips plugins, MCP servers, settings-derived hooks, and `CLAUDE.md`
+(the pre-cache-economics behavior) for users who want fork sessions to run bare. Unknown
+values warn and fall back to `open`.
 
 `permission_mode` sets the default `--permission-mode` for every fork run
 (`default` | `acceptEdits` | `bypassPermissions`; unknown values warn and are ignored). A

@@ -2,10 +2,14 @@
 //! against the parent (or a predecessor fork's) session and capture its
 //! final report.
 //!
-//! Isolation deliberately avoids `--bare` (it disables subscription OAuth):
-//! `--setting-sources ""` drops user/project settings (and with them hooks
-//! and plugins), `--strict-mcp-config` drops MCP servers, and
-//! `disableAllHooks` belts-and-suspenders the hook recursion.
+//! By default (open isolation) a fork inherits the user's full config —
+//! plugins, MCP servers, skills, CLAUDE.md — so its request prefix matches a
+//! normal session and reuses the prompt cache. Recursion is severed at the
+//! hook layer by the `FORKSAN_FORK` env guard rather than by stripping
+//! config. `isolation = "hermetic"` restores the old bare fork: it avoids
+//! `--bare` (which disables subscription OAuth) and instead drops settings
+//! and plugins (`--setting-sources ""`), MCP servers (`--strict-mcp-config`),
+//! and hooks (`disableAllHooks`).
 
 use crate::daemon::Daemon;
 use forksan_core::config::Config;
@@ -212,11 +216,6 @@ pub async fn run_one_fork(
             .arg("--fork-session")
             .arg("--output-format")
             .arg("json")
-            .arg("--setting-sources")
-            .arg("")
-            .arg("--strict-mcp-config")
-            .arg("--settings")
-            .arg(r#"{"disableAllHooks":true}"#)
             .current_dir(cwd)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("DISABLE_AUTOUPDATER", "1")
@@ -228,11 +227,27 @@ pub async fn run_one_fork(
             .env("FORKSAN_FORK_NAME", &sel.name)
             .env("FORKSAN_TRIGGER", &sel.trigger)
             .env("FORKSAN_PROJECT_ROOT", project_root)
+            // Recursion guard: the fork loads the user's full config in open
+            // mode (including forksan's own plugin), so its inherited hooks
+            // would re-enter the daemon. `FORKSAN_FORK` makes every forksan
+            // hook inside the fork bail out immediately.
+            .env("FORKSAN_FORK", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
+        // Hermetic isolation (opt-in) strips the user's plugins, MCP servers,
+        // and settings-derived hooks so the fork runs bare. Open mode (the
+        // default) keeps them for prompt-cache reuse; recursion is severed by
+        // the `FORKSAN_FORK` guard above instead.
+        if cfg.isolation == forksan_core::config::Isolation::Hermetic {
+            cmd.arg("--setting-sources")
+                .arg("")
+                .arg("--strict-mcp-config")
+                .arg("--settings")
+                .arg(r#"{"disableAllHooks":true}"#);
+        }
         if let Some(model) = &sel.def.model {
             cmd.arg("--model").arg(model);
         }

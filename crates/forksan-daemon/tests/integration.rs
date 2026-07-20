@@ -608,6 +608,69 @@ fn config_permission_mode_applies_and_fork_overrides() {
 }
 
 #[test]
+fn open_isolation_omits_isolation_flags() {
+    let mut h = Harness::new("1h");
+    h.write_fork("f.md", "---\nrun_on: [session_start]\n---\nOPEN WORK");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    let start = Instant::now();
+    let inv = loop {
+        if let Some(inv) = h
+            .invocations()
+            .into_iter()
+            .find(|i| i.prompt.contains("OPEN WORK"))
+        {
+            break inv;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "fork never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Default (open) mode: none of the isolation flags are present, and the
+    // recursion guard env is set.
+    for flag in ["--setting-sources", "--strict-mcp-config", "--settings"] {
+        assert!(
+            !inv.args.iter().any(|a| a == flag),
+            "open mode leaked isolation flag {flag}: {:?}",
+            inv.args
+        );
+    }
+    assert!(inv.env.contains("fork_name=f"));
+}
+
+#[test]
+fn hermetic_isolation_includes_isolation_flags() {
+    let mut h = Harness::new("1h");
+    h.append_config("isolation = \"hermetic\"");
+    h.write_fork("f.md", "---\nrun_on: [session_start]\n---\nHERMETIC WORK");
+    h.start_daemon();
+
+    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
+
+    let start = Instant::now();
+    let inv = loop {
+        if let Some(inv) = h
+            .invocations()
+            .into_iter()
+            .find(|i| i.prompt.contains("HERMETIC WORK"))
+        {
+            break inv;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "fork never ran");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Hermetic mode restores all three isolation flags.
+    for flag in ["--setting-sources", "--strict-mcp-config", "--settings"] {
+        assert!(
+            inv.args.iter().any(|a| a == flag),
+            "hermetic mode missing isolation flag {flag}: {:?}",
+            inv.args
+        );
+    }
+}
+
+#[test]
 fn resume_race_retries_until_transcript_ready() {
     let mut h = Harness::new("1h");
     h.write_fork(

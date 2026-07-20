@@ -47,6 +47,18 @@ pub fn run_hook(kind: HookKind) {
 }
 
 fn run_hook_inner(kind: HookKind) -> Option<()> {
+    // Recursion guard. A fork subprocess inherits the fork's environment,
+    // which carries `FORKSAN_FORK` (and `FORKSAN_SESSION_ID`). In open
+    // isolation the fork loads the user's full config, including forksan's own
+    // plugin, so its hooks would re-enter the daemon and spawn forks of forks.
+    // These vars are set ONLY by the runner and must NEVER be exported into a
+    // real Claude Code session — their presence means "we are inside a fork",
+    // so do nothing: no output, no daemon contact, no spawn.
+    if std::env::var_os("FORKSAN_FORK").is_some()
+        || std::env::var_os("FORKSAN_SESSION_ID").is_some()
+    {
+        return Some(());
+    }
     let mut raw = String::new();
     use std::io::Read;
     std::io::stdin().read_to_string(&mut raw).ok()?;

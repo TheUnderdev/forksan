@@ -3,6 +3,13 @@
 # updates), or kick off a background bootstrap when it's missing. A hook
 # must never break the session, so every path here exits 0.
 
+# Recursion guard: inside a fork subprocess these vars are set by the forksan
+# runner (open-isolation forks load the plugin). Bail before any binary exec.
+# The Rust entrypoint enforces the same guard as the real defense.
+if [ -n "${FORKSAN_FORK}" ] || [ -n "${FORKSAN_SESSION_ID}" ]; then
+    exit 0
+fi
+
 BIN="${CLAUDE_PLUGIN_DATA}/bin/forksan"
 if [ -x "$BIN" ]; then
     exec "$BIN" hook "$1"

@@ -198,6 +198,51 @@ fn disable_tags_env_filters_fork() {
 }
 
 #[test]
+fn fork_env_guard_short_circuits_hook() {
+    let env = Env::new("1h");
+    std::fs::write(
+        env.project.join(".forksan/forks/journal.md"),
+        "---\nrun_on: [session_start]\n---\nBODY",
+    )
+    .unwrap();
+
+    // A hook running inside a fork subprocess inherits FORKSAN_FORK; it must do
+    // nothing at all — no output, no daemon contact, no spawn.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_forksan"))
+        .args(["hook", "session-start"])
+        .env("FORKSAN_HOME", &env.home)
+        .env("FORKSAN_SOCKET", &env.socket)
+        .env("STUB_DIR", &env.stub_dir)
+        .env("FORKSAN_FORK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(env.hook_input("s1").to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "guarded hook exited nonzero: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "guarded hook produced output: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // No daemon was spawned.
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !env.socket.exists(),
+        "a daemon was spawned despite the fork guard"
+    );
+    assert!(!env.stub_ran(), "a fork ran despite the guard");
+}
+
+#[test]
 fn concurrent_hooks_race_to_one_daemon() {
     let env = Env::new("1h");
     // Several session-starts at once: exactly one daemon must win.
