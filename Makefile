@@ -28,8 +28,9 @@ build:
 	cargo build --workspace
 
 # Cross-compiled release tarballs for all four targets into dist/.
-# macOS targets build natively (rustup target add as needed); Linux musl
-# targets need `cross` (cargo install cross) and a running Docker daemon.
+# macOS targets build natively; Linux musl targets link through zig
+# (brew install zig cargo-zigbuild) — cross/Docker doesn't work from
+# an Apple Silicon host (needs a non-host rustup toolchain + qemu).
 dist: $(addprefix dist-,$(MAC_TARGETS) $(LINUX_TARGETS))
 
 dist-aarch64-apple-darwin dist-x86_64-apple-darwin: dist-%:
@@ -38,8 +39,9 @@ dist-aarch64-apple-darwin dist-x86_64-apple-darwin: dist-%:
 	$(MAKE) package TARGET=$*
 
 dist-x86_64-unknown-linux-musl dist-aarch64-unknown-linux-musl: dist-%:
-	@command -v cross >/dev/null || { echo "cross not found: cargo install cross (needs Docker running)"; exit 1; }
-	cross build --release --target $* -p forksan -p forksan-daemon
+	@command -v cargo-zigbuild >/dev/null || { echo "cargo-zigbuild not found: brew install zig cargo-zigbuild"; exit 1; }
+	rustup target add $*
+	cargo zigbuild --release --target $* -p forksan -p forksan-daemon
 	$(MAKE) package TARGET=$*
 
 package:
