@@ -80,6 +80,9 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
         enable_tags: enable_tags.clone(),
         disable_tags: disable_tags.clone(),
         waking: None,
+        notif_tool_use_id: None,
+        notif_task_id: None,
+        notif_status: None,
     };
 
     match kind {
@@ -96,15 +99,27 @@ fn run_hook_inner(kind: HookKind) -> Option<()> {
                 spawn_daemon_detached(&paths);
                 return Some(());
             };
-            // Sniff the prompt: a continuation (asyncRewake wake reminder or a
-            // fork-completion task notification) is non-waking and must not
-            // advance the pause epoch. `None` (no prompt text) lets the daemon
-            // decide via its post-wake grace window.
+            // Sniff the prompt. An asyncRewake wake reminder (our marker) is
+            // always a non-waking continuation. A task notification gets its
+            // envelope ids forwarded so the daemon can decide whether it is
+            // one of its own fork completions (non-waking) or some other
+            // background task finishing (genuine activity — a new pause); the
+            // coarse `waking: false` stays as the old-daemon fallback. `None`
+            // (no prompt text) lets the daemon decide via its post-wake grace
+            // window.
             let mut ev = event(EventKind::PromptSubmit);
-            ev.waking = input
-                .prompt
-                .as_deref()
-                .map(|p| !autofork_core::wake::looks_like_continuation(p));
+            if let Some(p) = input.prompt.as_deref() {
+                if p.contains(autofork_core::wake::WAKE_MARKER) {
+                    ev.waking = Some(false);
+                } else if let Some(n) = autofork_core::notification::parse_task_notification(p) {
+                    ev.waking = Some(false);
+                    ev.notif_tool_use_id = n.tool_use_id;
+                    ev.notif_task_id = n.task_id;
+                    ev.notif_status = n.status;
+                } else {
+                    ev.waking = Some(true);
+                }
+            }
             let _ = client.request(RequestBody::Event(ev));
         }
         HookKind::StopWait => {

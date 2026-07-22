@@ -5,6 +5,14 @@
 //!
 //! The parent model is told to spawn each fork with a prompt that makes the
 //! *fork* read the fork file — the parent must never read it itself.
+//!
+//! `after` dependencies are daemon-enforced: a wake carries only the roots of
+//! the due set, dependents are held by the daemon (with a one-line note here
+//! so the visible payload explains itself), and when the daemon observes a
+//! predecessor's completion it answers the next parked Stop poll with a
+//! *release* payload ([`build_release_payload`]) for the now-unblocked forks.
+
+use crate::notification::TASK_NOTIFICATION_PREFIX;
 
 /// The greppable marker every wake block carries (`source: autofork`). The
 /// payload builder emits it and the continuation sniffer anchors on it, so the
@@ -13,15 +21,20 @@
 /// inside the reminder text.
 pub const WAKE_MARKER: &str = "source: autofork";
 
-/// The prefix Claude Code uses for a fork-completion (task) notification the
-/// session receives as a non-waking continuation.
-pub const TASK_NOTIFICATION_PREFIX: &str = "<task-notification>";
+/// The fingerprint every fork spawn prompt carries. The transcript watcher
+/// anchors on it to recognize an Agent `tool_use` as one of autofork's fork
+/// spawns and to read back the fork's name (the model quotes the spawn prompt
+/// verbatim, fingerprint included). Emitted by [`spawn_prompt`]; the two must
+/// never drift.
+pub const SPAWN_CTX_PREFIX: &str = "Context for this run: fork '";
 
 /// Whether a submitted "prompt" is actually a non-waking continuation — an
-/// asyncRewake wake reminder (carries [`WAKE_MARKER`]) or a fork-completion
-/// task notification (starts with [`TASK_NOTIFICATION_PREFIX`]) — rather than
-/// genuine user input. Used to decide whether a UserPromptSubmit advances the
-/// pause epoch.
+/// asyncRewake wake reminder (carries [`WAKE_MARKER`]) or a background-task
+/// completion notification — rather than genuine user input. This is the
+/// coarse sniff (any task notification): the daemon refines task notifications
+/// against its recorded fork spawns to tell its own forks' completions (a
+/// continuation of the same pause) from other background work finishing (the
+/// start of a new one).
 pub fn looks_like_continuation(prompt: &str) -> bool {
     let trimmed = prompt.trim_start();
     trimmed.starts_with(TASK_NOTIFICATION_PREFIX) || prompt.contains(WAKE_MARKER)
@@ -39,8 +52,26 @@ pub struct DueFork {
     /// Whether concurrent runs are allowed (`overlap: true`). When false, the
     /// wake block tells the model to skip if a previous run is still active.
     pub overlap: bool,
-    /// Predecessor fork names (within this due set) this fork runs `after`.
+    /// Predecessor fork names this fork ran `after` (empty in a normal wake;
+    /// set in a release payload, where it names the finished predecessors).
     pub after: Vec<String>,
+}
+
+/// A fork the daemon is holding back until its predecessors finish, named in
+/// the wake payload so the visible text explains why it didn't spawn.
+#[derive(Debug, Clone)]
+pub struct HeldFork {
+    pub name: String,
+    /// The predecessor fork names it waits for.
+    pub after: Vec<String>,
+}
+
+fn quoted_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn spawn_prompt(
@@ -50,8 +81,8 @@ fn spawn_prompt(
     project_root: &str,
 ) -> String {
     format!(
-        "Read the file {path} and follow the instructions in its body. Context for this \
-         run: fork '{name}', trigger '{trigger}', parent session {session_id}, conversation \
+        "Read the file {path} and follow the instructions in its body. \
+         {SPAWN_CTX_PREFIX}{name}', trigger '{trigger}', parent session {session_id}, conversation \
          {conversation_id}, project root {project_root}. The conversation id is stable when \
          a session is resumed (a resumed session gets a fresh session id); key any \
          per-conversation artifacts on it. Your final message is your report.",
@@ -88,26 +119,21 @@ fn root_block(
     )
 }
 
-fn dependent_block(
+fn release_block(
     fork: &DueFork,
     session_id: &str,
     conversation_id: &str,
     project_root: &str,
 ) -> String {
-    let preds = fork
-        .after
-        .iter()
-        .map(|p| format!("'{p}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let preds = quoted_names(&fork.after);
     format!(
-        "---\nsource: autofork\ndue: {name} (trigger: {trigger}) — after {preds}\n---\n\
-         Do not spawn fork '{name}' yet. After {preds} finish and you receive their \
-         completion notifications, spawn a background fork subagent: use the Agent tool with \
+        "---\nsource: autofork\ndue: {name} (trigger: {trigger}) — released, {preds} finished\n---\n\
+         Fork {preds} has finished; its completion notification (with its report) is earlier \
+         in this conversation. Spawn a background fork subagent now: use the Agent tool with \
          subagent_type \"fork\" and this prompt: \"{prompt} This fork runs after {preds}; \
-         include the report(s) they returned in their completion notifications so the fork \
-         can build on them.\" Do not read that file yourself — only the fork reads \
-         it.{overlap}",
+         append the report(s) {preds} returned in their completion notifications to this \
+         prompt, so the fork can build on them.\" Do not read that file yourself — only the \
+         fork reads it.{overlap}",
         name = fork.name,
         trigger = fork.trigger,
         prompt = spawn_prompt(fork, session_id, conversation_id, project_root),
@@ -115,10 +141,22 @@ fn dependent_block(
     )
 }
 
-/// Build the full wake payload for a set of due forks. Roots (no `after`
-/// within the set) come first as immediate spawn blocks; dependents follow as
-/// deferred spawn instructions. A trailing line asks the model to acknowledge
-/// the background work so the harness doesn't nudge about missing output.
+fn closer(n_blocks: usize) -> String {
+    let noun = if n_blocks == 1 {
+        "the fork above"
+    } else {
+        "all forks above"
+    };
+    format!(
+        "After spawning {noun}, reply with one short line acknowledging the background \
+         work and stop.{CONTINGENCY}"
+    )
+}
+
+/// Build the full wake payload for a set of due forks: `forks` are the roots
+/// (spawn-now blocks); `held` names any dependents the daemon keeps back until
+/// their predecessors finish (informational only — the model must not act on
+/// them; the daemon wakes the session again when they release).
 ///
 /// `conversation_id` is the identity that survives session resume (the
 /// transcript file stem — resumed legs get a fresh session id but append to
@@ -129,28 +167,48 @@ pub fn build_wake_payload(
     conversation_id: &str,
     project_root: &str,
     forks: &[DueFork],
+    held: &[HeldFork],
 ) -> String {
-    let mut blocks: Vec<String> = Vec::new();
-    for fork in forks.iter().filter(|f| f.after.is_empty()) {
-        blocks.push(root_block(fork, session_id, conversation_id, project_root));
-    }
-    for fork in forks.iter().filter(|f| !f.after.is_empty()) {
-        blocks.push(dependent_block(
-            fork,
-            session_id,
-            conversation_id,
-            project_root,
-        ));
-    }
-
-    let closer = if blocks.len() == 1 {
-        "After spawning the fork above, reply with one short line acknowledging the \
-         background work and stop."
+    let blocks: Vec<String> = forks
+        .iter()
+        .map(|f| root_block(f, session_id, conversation_id, project_root))
+        .collect();
+    let held_note = if held.is_empty() {
+        String::new()
     } else {
-        "After spawning all forks above, reply with one short line acknowledging the \
-         background work and stop."
+        let listed = held
+            .iter()
+            .map(|h| format!("'{}' (after {})", h.name, quoted_names(&h.after)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "\n\nAlso due but held back by autofork until their predecessors finish: {listed}. \
+             Do not spawn these now — you will receive their spawn instructions in a later \
+             wake once the predecessors' completion notifications arrive."
+        )
     };
-    format!("{}\n\n{closer}{CONTINGENCY}", blocks.join("\n\n"))
+    format!(
+        "{}{held_note}\n\n{}",
+        blocks.join("\n\n"),
+        closer(blocks.len())
+    )
+}
+
+/// Build the payload that releases held dependents after their predecessors
+/// finished: spawn-now blocks whose prompts tell the model to carry the
+/// predecessors' reports along. Each entry's `after` must name its finished
+/// predecessors.
+pub fn build_release_payload(
+    session_id: &str,
+    conversation_id: &str,
+    project_root: &str,
+    forks: &[DueFork],
+) -> String {
+    let blocks: Vec<String> = forks
+        .iter()
+        .map(|f| release_block(f, session_id, conversation_id, project_root))
+        .collect();
+    format!("{}\n\n{}", blocks.join("\n\n"), closer(blocks.len()))
 }
 
 /// Rides in every wake to recover from Claude Code's dynamic agent disclosure:
@@ -188,7 +246,7 @@ mod tests {
 
     #[test]
     fn payload_carries_the_sniffer_marker() {
-        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], false)]);
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], false)], &[]);
         assert!(
             p.contains(WAKE_MARKER),
             "payload must carry the wake marker"
@@ -196,6 +254,15 @@ mod tests {
         assert!(
             looks_like_continuation(&p),
             "the builder's own output must sniff as a continuation"
+        );
+    }
+
+    #[test]
+    fn spawn_prompt_carries_the_fingerprint() {
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("journal", &[], false)], &[]);
+        assert!(
+            p.contains(&format!("{SPAWN_CTX_PREFIX}journal'")),
+            "the spawn prompt must carry the transcript-watcher fingerprint"
         );
     }
 
@@ -218,7 +285,13 @@ mod tests {
 
     #[test]
     fn single_root_block() {
-        let p = build_wake_payload("sid-1", "conv-1", "/proj", &[due("journal", &[], false)]);
+        let p = build_wake_payload(
+            "sid-1",
+            "conv-1",
+            "/proj",
+            &[due("journal", &[], false)],
+            &[],
+        );
         assert!(p.contains("---\nsource: autofork\ndue: journal (trigger: idle)\n---\n"));
         assert!(p.contains("subagent_type \"fork\""));
         assert!(p.contains("Read the file /x/journal.md"));
@@ -244,7 +317,7 @@ mod tests {
 
     #[test]
     fn overlap_true_omits_skip_line() {
-        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], true)]);
+        let p = build_wake_payload("s", "conv-s", "/p", &[due("j", &[], true)], &[]);
         assert!(!p.contains("skip spawning it"));
     }
 
@@ -255,6 +328,7 @@ mod tests {
             "conv-s",
             "/p",
             &[due("a", &[], false), due("b", &[], false)],
+            &[],
         );
         assert!(p.contains("due: a (trigger: idle)"));
         assert!(p.contains("due: b (trigger: idle)"));
@@ -262,18 +336,41 @@ mod tests {
     }
 
     #[test]
-    fn dependents_are_deferred_and_reference_predecessors() {
+    fn held_dependents_are_named_but_not_spawned() {
         let p = build_wake_payload(
             "s",
             "conv-s",
             "/p",
-            &[due("alpha", &[], false), due("beta", &["alpha"], false)],
+            &[due("alpha", &[], false)],
+            &[HeldFork {
+                name: "beta".to_string(),
+                after: vec!["alpha".to_string()],
+            }],
         );
-        // Root block for alpha comes first.
-        let alpha_pos = p.find("Spawn a background fork subagent now").unwrap();
-        let beta_pos = p.find("Do not spawn fork 'beta' yet").unwrap();
-        assert!(alpha_pos < beta_pos, "root must precede dependent");
-        assert!(p.contains("After 'alpha' finish"));
-        assert!(p.contains("include the report(s) they returned"));
+        assert!(p.contains("due: alpha (trigger: idle)"));
+        assert!(p.contains("held back by autofork"));
+        assert!(p.contains("'beta' (after 'alpha')"));
+        assert!(p.contains("Do not spawn these now"));
+        // No spawn block for the dependent.
+        assert!(!p.contains("due: beta"));
+        assert!(!p.contains("/x/beta.md"));
+        // Held note must not change the closer's count.
+        assert!(p.contains("After spawning the fork above"));
+    }
+
+    #[test]
+    fn release_payload_quotes_predecessors() {
+        let p = build_release_payload("s", "conv-s", "/p", &[due("beta", &["alpha"], false)]);
+        assert!(
+            p.contains(WAKE_MARKER),
+            "release must sniff as continuation"
+        );
+        assert!(p.contains("due: beta (trigger: idle) — released, 'alpha' finished"));
+        assert!(p.contains("Spawn a background fork subagent now"));
+        assert!(p.contains("This fork runs after 'alpha'"));
+        assert!(p.contains("append the report(s) 'alpha' returned"));
+        assert!(p.contains("Read the file /x/beta.md"));
+        assert!(p.contains("skip spawning it"));
+        assert!(p.contains("After spawning the fork above"));
     }
 }

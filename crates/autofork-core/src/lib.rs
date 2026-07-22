@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod duration;
 pub mod frontmatter;
 pub mod moments;
+pub mod notification;
 pub mod project;
 pub mod protocol;
 pub mod schedule;

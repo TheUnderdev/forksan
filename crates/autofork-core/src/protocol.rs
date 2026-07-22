@@ -65,8 +65,22 @@ pub struct Event {
     /// or a non-waking continuation — an asyncRewake wake or a fork-completion
     /// task notification (`Some(false)`). `None` = the CLI couldn't tell (no
     /// prompt text); the daemon decides via its post-wake grace window.
+    /// When the notif ids below are present, the daemon's own classification
+    /// (fork-spawn match) overrides this coarse sniff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waking: Option<bool>,
+    /// For a PromptSubmit that is a `<task-notification>`: the `tool_use_id`
+    /// of the tool call that started the finished task, so the daemon can
+    /// check it against its recorded fork spawns. Additive field (no proto
+    /// bump); old daemons ignore it and keep the coarse `waking` sniff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_tool_use_id: Option<String>,
+    /// The finished task's own id (`<task-id>`), the fallback match key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_task_id: Option<String>,
+    /// The notification's `<status>` (`completed`/`failed`/`stopped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notif_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +220,9 @@ mod tests {
                 enable_tags: None,
                 disable_tags: None,
                 waking: None,
+                notif_tool_use_id: None,
+                notif_task_id: None,
+                notif_status: None,
             }),
         };
         let line = encode(&req).unwrap();

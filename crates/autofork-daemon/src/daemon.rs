@@ -74,9 +74,16 @@ pub struct Daemon {
     pub shutdown: tokio::sync::Notify,
 }
 
-/// How long after issuing a wake an ambiguous (no prompt text) PromptSubmit is
-/// assumed to be a continuation rather than genuine user activity.
-const WAKE_GRACE_SECS: i64 = 20;
+/// How long after issuing a wake an unattributable PromptSubmit — no prompt
+/// text, or a task notification the spawn registry can't match — is assumed to
+/// be a continuation rather than genuine user activity. Overridable via
+/// `AUTOFORK_WAKE_GRACE_SECS` (tests shorten it).
+fn wake_grace_secs() -> i64 {
+    std::env::var("AUTOFORK_WAKE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
 
 /// After a parked poll drops unanswered, wait this long for a fresh event
 /// before closing the session (the Claude process is presumed dead). Overridable
@@ -227,7 +234,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .get(session_id)
-            .is_some_and(|&at| t - at < WAKE_GRACE_SECS)
+            .is_some_and(|&at| t - at < wake_grace_secs())
     }
 
     /// Handle one fast lifecycle event; returns the response body.
@@ -255,14 +262,44 @@ impl Daemon {
                 ResponseBody::Ack
             }
             EventKind::PromptSubmit => {
-                // Is this genuine user activity, or a non-waking continuation
-                // (an asyncRewake wake reminder / a fork-completion task
-                // notification)? The CLI sniffs the prompt text (primary); when
-                // it can't tell (`None`), the daemon's post-wake grace window is
-                // the belt.
-                let waking = ev
-                    .waking
-                    .unwrap_or_else(|| !self.recently_woke(&ev.session_id, t));
+                // Is this genuine user activity, or a non-waking continuation?
+                // An asyncRewake wake reminder sniffs on its marker (the CLI's
+                // `waking` field). A task notification is only a continuation
+                // when it reports one of the daemon's own fork spawns — any
+                // other background task finishing is the session picking real
+                // work back up, so it must start a new pause (otherwise idle
+                // forks stay latched to the old one and never fire again). The
+                // post-wake grace window remains the belt for notifications
+                // the spawn registry can't vouch for either way (e.g. a fork
+                // that completed before its spawn's Stop was ever ingested).
+                let waking = if ev.notif_tool_use_id.is_some() || ev.notif_task_id.is_some() {
+                    let store = self.store.lock().unwrap();
+                    let status = ev.notif_status.as_deref().unwrap_or("");
+                    let matched = if autofork_core::notification::is_terminal_status(status) {
+                        store
+                            .mark_spawn_terminal(
+                                &ev.session_id,
+                                ev.notif_tool_use_id.as_deref(),
+                                ev.notif_task_id.as_deref(),
+                                status,
+                                t,
+                            )
+                            .unwrap_or(false)
+                    } else {
+                        store
+                            .is_fork_spawn(
+                                &ev.session_id,
+                                ev.notif_tool_use_id.as_deref(),
+                                ev.notif_task_id.as_deref(),
+                            )
+                            .unwrap_or(false)
+                    };
+                    drop(store);
+                    !matched && !self.recently_woke(&ev.session_id, t)
+                } else {
+                    ev.waking
+                        .unwrap_or_else(|| !self.recently_woke(&ev.session_id, t))
+                };
                 {
                     let store = self.store.lock().unwrap();
                     let _ = store.upsert_session(
@@ -277,9 +314,20 @@ impl Daemon {
                     );
                     let _ = store.set_last_activity(&ev.session_id, t);
                     // Genuine activity begins a new pause: advance the epoch
-                    // (releasing per-pause idle latches) and reset the baseline.
+                    // (releasing per-pause idle latches), reset the baseline,
+                    // and drop any dependents still held for the old moment
+                    // (their pause is over; they re-select on the next one).
                     if waking {
                         let _ = store.bump_pause_epoch(&ev.session_id);
+                        if let Ok(n) = store.clear_pending_deps(&ev.session_id) {
+                            if n > 0 {
+                                tracing::info!(
+                                    session = %ev.session_id,
+                                    dropped = n,
+                                    "user activity dropped held dependents"
+                                );
+                            }
+                        }
                     }
                 }
                 // A turn is in flight either way: cancel any parked stop-wait so
@@ -325,7 +373,7 @@ impl Daemon {
             // Stop keeps the existing one, so idle deadlines don't reset.
             let _ = store.set_pause_started_at_if_unset(&ev.session_id, t);
         }
-        let prompt_tokens = self.read_gauge(&ev);
+        let prompt_tokens = self.ingest_transcript(&ev);
         let cfg = self.cfg_for(Some(&ev.project_root));
 
         // Register this wait so PromptSubmit / SessionEnd can cancel it. A
@@ -345,6 +393,13 @@ impl Daemon {
         }) else {
             return ResponseBody::Waited;
         };
+        // Held dependents whose predecessors' completions the transcript (or a
+        // notification PromptSubmit) just confirmed release right now — this is
+        // the Stop that follows the completion's relay turn, so the reports are
+        // already in the session's context.
+        if let Some(payload) = crate::planner::release_due(self, &session) {
+            return ResponseBody::Wake { payload };
+        }
         // Idle timing is measured from the pause baseline (the first Stop of
         // this pause), so a wake-turn's own Stop doesn't restart the clock.
         let baseline = session.pause_started_at.unwrap_or(t);
@@ -424,28 +479,57 @@ impl Daemon {
         ResponseBody::Waited
     }
 
-    /// Read the transcript gauge (updating the stored offset) and return the
-    /// session's best-known prompt token count, or `None` when unavailable.
-    fn read_gauge(&self, ev: &Event) -> Option<u64> {
+    /// Read the transcript delta (updating the stored offset): refresh the
+    /// context gauge, record fork spawns and their task ids, and mark spawns
+    /// terminal on completion notifications. Returns the session's best-known
+    /// prompt token count, or `None` when unavailable.
+    fn ingest_transcript(&self, ev: &Event) -> Option<u64> {
         let transcript = ev.transcript_path.as_deref()?;
         let session = {
             let store = self.store.lock().unwrap();
             store.get_session(&ev.session_id).ok().flatten()?
         };
-        match crate::transcript::read_gauge(transcript, session.transcript_offset) {
-            Ok(gauge) => {
-                {
-                    let store = self.store.lock().unwrap();
-                    let _ = store.set_transcript_gauge(
-                        &ev.session_id,
-                        gauge.new_offset,
-                        gauge.prompt_tokens,
-                    );
+        match crate::transcript::read_delta(transcript, session.transcript_offset) {
+            Ok(delta) => {
+                let t = now();
+                let store = self.store.lock().unwrap();
+                for (tool_use_id, fork_name) in &delta.spawns {
+                    tracing::debug!(session = %ev.session_id, tool_use_id, fork = ?fork_name,
+                        "fork spawn observed");
+                    let _ =
+                        store.record_spawn(&ev.session_id, tool_use_id, fork_name.as_deref(), t);
                 }
-                gauge.prompt_tokens.or(session.prompt_tokens)
+                for (tool_use_id, task_id) in &delta.task_ids {
+                    let _ = store.set_spawn_task_id(&ev.session_id, tool_use_id, task_id);
+                }
+                for n in &delta.notifications {
+                    let Some(status) = n
+                        .status
+                        .as_deref()
+                        .filter(|s| autofork_core::notification::is_terminal_status(s))
+                    else {
+                        continue;
+                    };
+                    if let Ok(true) = store.mark_spawn_terminal(
+                        &ev.session_id,
+                        n.tool_use_id.as_deref(),
+                        n.task_id.as_deref(),
+                        status,
+                        t,
+                    ) {
+                        tracing::debug!(session = %ev.session_id, status,
+                            tool_use_id = ?n.tool_use_id, "fork completion observed");
+                    }
+                }
+                let _ = store.set_transcript_gauge(
+                    &ev.session_id,
+                    delta.new_offset,
+                    delta.prompt_tokens,
+                );
+                delta.prompt_tokens.or(session.prompt_tokens)
             }
             Err(e) => {
-                tracing::debug!(error = %e, "transcript gauge unavailable");
+                tracing::debug!(error = %e, "transcript delta unavailable");
                 session.prompt_tokens
             }
         }

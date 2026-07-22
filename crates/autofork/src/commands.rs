@@ -274,6 +274,7 @@ pub fn run_fork(paths: &Paths, name: Option<String>, tag: Option<String>) -> Res
         "(the current conversation)",
         &root.to_string_lossy(),
         &due,
+        &[],
     );
 
     println!(

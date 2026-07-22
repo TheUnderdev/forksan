@@ -143,16 +143,27 @@ warnings). Fork bodies should be **idempotent** — a fork may fire on any idle 
 
 **Once per pause.** An idle-triggered fork fires **at most once per idle pause** (restoring the
 pre-v0.5 "fires once per idle pause" semantics). A *pause* is the quiet stretch after one of your
-turns; only genuine user activity starts a new one. This matters because each wake turn — and each
+turns; genuine activity starts a new one. This matters because each wake turn — and each
 fork-completion relay turn — ends with its own `Stop`, which re-arms the machinery; without the
 per-pause rule a fork whose `throttle` is shorter than its idle deadline would wake you again every
 cycle, forever. So within a single pause a fork issues one wake and no more, regardless of throttle;
 `throttle` still applies *across* pauses. (`context_*` thresholds are separately once-per-session.)
 
-`after` sequencing: the wake payload tells the model to spawn the root fork(s) now and, once a
-predecessor's completion notification arrives, spawn its dependents with the predecessor's report
-quoted into their prompt (`after: [research, lint]` waits for both). The parent orchestrates the
-chain from the notifications it receives.
+What counts as genuine activity: your own prompts, and any background task finishing that autofork
+didn't spawn (a `run_in_background` command, a workflow, an agent of your own). The daemon records
+every fork spawn's tool-use id from the session transcript, so when a completion notification
+arrives it can tell its own forks (a continuation of the same pause — never re-fires anything) from
+other background work (the session picked real work back up, so the next quiet stretch is a new
+pause and idle forks fire again).
+
+`after` sequencing is **daemon-enforced**: a wake spawns only the root fork(s) and names the held
+dependents; the daemon keeps the dependents until it observes every predecessor's completion
+notification, then answers the very next `Stop` with their spawn instructions (telling the model to
+carry the predecessors' reports into the dependents' prompts — `after: [research, lint]` waits for
+both). Held dependents are dropped when you send a real message before the chain finishes (the
+whole chain simply re-fires on the next pause) and when the session ends. Dependencies resolve
+within one due batch: `after` sequences forks that come due together, it does not delay a fork
+until some other fork eventually runs.
 
 By default two runs of the same fork never overlap: the wake block for a fork tells the model to
 skip spawning it if a previous run of that fork is still among its running background tasks. Set
@@ -220,8 +231,11 @@ shared budget for the whole group. A wake of any fork with the tag suppresses ev
 sharing it until the window passes. It composes with a fork's own `throttle` (both must pass) and
 layers per key (project entries override home).
 
-Because the daemon can no longer observe fork completion, `throttle` and the tag throttles are
-stamped at **wake-issuance** (when the daemon answers the poll), not at fork completion.
+`throttle` and the tag throttles are stamped at **wake-issuance** (when the daemon answers the
+poll), not at fork completion — a held `after` dependent stamps when its wake was issued, not when
+it is eventually released. (The daemon does observe fork completions in the transcript, but a spawn
+it never sees — a model that skipped or paraphrased the Agent call — must not unlock the throttle
+forever, so issuance stays the stamp point.)
 
 ## Costs, caveats
 

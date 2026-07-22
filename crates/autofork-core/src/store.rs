@@ -6,16 +6,21 @@
 //! - fires latch: context triggers fire at most once per (session, fork,
 //!   trigger label).
 //! - runs: since v0.5 a "run" is a wake issued to a session (state `issued`),
-//!   recorded so per-tag throttles can find the last wake per tag. The daemon
-//!   no longer observes fork completion.
+//!   recorded so per-tag throttles can find the last wake per tag.
+//! - spawns (v5): fork spawns observed in the session transcript, keyed by the
+//!   Agent `tool_use` id, so completion notifications can be recognized as the
+//!   daemon's own forks (pause-epoch classification) and so `after` dependents
+//!   can be released when their predecessors reach a terminal status.
+//! - pending deps (v5): dependents of a wake held back until their
+//!   predecessors finish; cleared by genuine user activity and session close.
 //!
-//! The schema is unchanged from v0.4 (v3): the `reports` table still exists
-//! but is no longer written or read (report delivery is native in v0.5).
+//! The `reports` table still exists but is no longer written or read (report
+//! delivery is native since v0.5).
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Split a comma-joined tag column back into a list (trimmed, empties
 /// dropped). `NULL` (unset) stays `None`.
@@ -76,6 +81,20 @@ pub struct RosterEntry {
     pub fork_path: PathBuf,
     pub queued_at: i64,
     pub ran_at: Option<i64>,
+}
+
+/// A dependent fork held back until its predecessors finish.
+#[derive(Debug, Clone)]
+pub struct PendingDep {
+    pub fork_name: String,
+    pub fork_path: PathBuf,
+    pub trigger_label: String,
+    pub overlap: bool,
+    /// Predecessor fork names that must reach a terminal status first.
+    pub preds: Vec<String>,
+    /// When the wake that held this dependent was issued; only predecessor
+    /// completions at or after this instant count.
+    pub created_at: i64,
 }
 
 /// A recorded wake (state `issued`).
@@ -198,6 +217,36 @@ impl Store {
                 "BEGIN;
                  ALTER TABLE sessions ADD COLUMN pause_epoch INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE sessions ADD COLUMN pause_started_at INTEGER;
+                 COMMIT;",
+            )?;
+        }
+        if version < 5 {
+            // Fork spawns observed in the transcript (fork_name is NULL when
+            // the spawn prompt didn't carry the fingerprint — such rows still
+            // classify completion notifications as "one of ours") and the
+            // dependents a wake held back until their predecessors finish.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS fork_spawns (
+                   session_id  TEXT NOT NULL,
+                   tool_use_id TEXT NOT NULL,
+                   task_id     TEXT,
+                   fork_name   TEXT,
+                   status      TEXT NOT NULL DEFAULT 'spawned',
+                   spawned_at  INTEGER NOT NULL,
+                   terminal_at INTEGER,
+                   PRIMARY KEY (session_id, tool_use_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS pending_deps (
+                   session_id    TEXT NOT NULL,
+                   fork_name     TEXT NOT NULL,
+                   fork_path     TEXT NOT NULL,
+                   trigger_label TEXT NOT NULL,
+                   overlap       INTEGER NOT NULL,
+                   preds         TEXT NOT NULL,
+                   created_at    INTEGER NOT NULL,
+                   PRIMARY KEY (session_id, fork_name)
+                 );
                  COMMIT;",
             )?;
         }
@@ -347,21 +396,19 @@ impl Store {
         Ok(())
     }
 
-    /// Close a session and clear its roster + latches.
+    /// Close a session and clear its roster, latches, spawns and pending deps.
     pub fn close_session(&self, session_id: &str) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE sessions SET status = 'closed' WHERE session_id = ?1",
             params![session_id],
         )?;
-        tx.execute(
-            "DELETE FROM fork_roster WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        tx.execute(
-            "DELETE FROM fork_fires WHERE session_id = ?1",
-            params![session_id],
-        )?;
+        for table in ["fork_roster", "fork_fires", "fork_spawns", "pending_deps"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                params![session_id],
+            )?;
+        }
         tx.commit()
     }
 
@@ -503,6 +550,176 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    // ---- fork spawns (observed in the transcript) ----
+
+    /// Record a fork spawn observed in the session transcript. `fork_name` is
+    /// `None` when the spawn prompt didn't carry the fingerprint (the row then
+    /// only classifies completion notifications, never releases dependents).
+    /// Idempotent per (session, tool_use_id).
+    pub fn record_spawn(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        fork_name: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO fork_spawns (session_id, tool_use_id, fork_name, spawned_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, tool_use_id, fork_name, now],
+        )?;
+        Ok(())
+    }
+
+    /// Attach the background task id to a recorded spawn (from the Agent
+    /// tool result's `agentId`). No-op for tool uses that aren't fork spawns.
+    pub fn set_spawn_task_id(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        task_id: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE fork_spawns SET task_id = COALESCE(task_id, ?3)
+             WHERE session_id = ?1 AND tool_use_id = ?2",
+            params![session_id, tool_use_id, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a completion notification's ids match a recorded fork spawn.
+    pub fn is_fork_spawn(
+        &self,
+        session_id: &str,
+        tool_use_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns
+             WHERE session_id = ?1
+               AND ((?2 IS NOT NULL AND tool_use_id = ?2)
+                 OR (?3 IS NOT NULL AND task_id = ?3))",
+            params![session_id, tool_use_id, task_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark a recorded fork spawn terminal (`completed`/`failed`/`stopped`),
+    /// matching by tool-use id or task id. Returns whether a spawn matched
+    /// (i.e. the notification was one of the daemon's own forks). A spawn
+    /// already terminal keeps its first status and `terminal_at`.
+    pub fn mark_spawn_terminal(
+        &self,
+        session_id: &str,
+        tool_use_id: Option<&str>,
+        task_id: Option<&str>,
+        status: &str,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        if !self.is_fork_spawn(session_id, tool_use_id, task_id)? {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE fork_spawns SET status = ?4, terminal_at = ?5
+             WHERE session_id = ?1 AND status = 'spawned'
+               AND ((?2 IS NOT NULL AND tool_use_id = ?2)
+                 OR (?3 IS NOT NULL AND task_id = ?3))",
+            params![session_id, tool_use_id, task_id, status, now],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether fork `fork_name` reached a terminal status in this session at
+    /// or after `since` (dependents count only completions observed after
+    /// their wake was issued).
+    pub fn fork_completed_since(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        since: i64,
+    ) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fork_spawns
+             WHERE session_id = ?1 AND fork_name = ?2
+               AND status IN ('completed','failed','stopped')
+               AND terminal_at >= ?3",
+            params![session_id, fork_name, since],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- pending dependents (held until predecessors finish) ----
+
+    /// Hold a dependent back until its predecessors finish. Overwrites any
+    /// stale pending row for the same fork (a fresh wake supersedes it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_pending_dep(
+        &self,
+        session_id: &str,
+        fork_name: &str,
+        fork_path: &Path,
+        trigger_label: &str,
+        overlap: bool,
+        preds: &[String],
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending_deps
+               (session_id, fork_name, fork_path, trigger_label, overlap, preds, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id,
+                fork_name,
+                fork_path.to_string_lossy(),
+                trigger_label,
+                overlap,
+                preds.join(","),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The session's held dependents, oldest first.
+    pub fn list_pending_deps(&self, session_id: &str) -> rusqlite::Result<Vec<PendingDep>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fork_name, fork_path, trigger_label, overlap, preds, created_at
+             FROM pending_deps WHERE session_id = ?1 ORDER BY created_at, fork_name",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(PendingDep {
+                fork_name: row.get(0)?,
+                fork_path: PathBuf::from(row.get::<_, String>(1)?),
+                trigger_label: row.get(2)?,
+                overlap: row.get(3)?,
+                preds: split_tags(row.get::<_, Option<String>>(4)?).unwrap_or_default(),
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Remove one held dependent (it was just released into a wake).
+    pub fn delete_pending_dep(&self, session_id: &str, fork_name: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_deps WHERE session_id = ?1 AND fork_name = ?2",
+            params![session_id, fork_name],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every held dependent for a session (genuine user activity ends the
+    /// moment they were due for). Returns how many were dropped.
+    pub fn clear_pending_deps(&self, session_id: &str) -> rusqlite::Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM pending_deps WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(n)
     }
 
     pub fn list_runs(&self, states: &[&str], limit: usize) -> rusqlite::Result<Vec<RunRow>> {
@@ -711,6 +928,96 @@ mod tests {
             s.get_session("a").unwrap().unwrap().pause_started_at,
             Some(200)
         );
+    }
+
+    #[test]
+    fn spawn_tracking_and_terminal_matching() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        s.record_spawn("a", "toolu_1", Some("journal"), 110)
+            .unwrap();
+        // Idempotent: a re-read delta re-recording the spawn changes nothing.
+        s.record_spawn("a", "toolu_1", None, 120).unwrap();
+        s.set_spawn_task_id("a", "toolu_1", "task_9").unwrap();
+        // Unknown tool uses are not fork spawns.
+        assert!(!s.is_fork_spawn("a", Some("toolu_other"), None).unwrap());
+        assert!(!s
+            .mark_spawn_terminal("a", Some("toolu_other"), Some("task_x"), "completed", 130)
+            .unwrap());
+        // Match by tool-use id or by task id; wrong session never matches.
+        assert!(s.is_fork_spawn("a", Some("toolu_1"), None).unwrap());
+        assert!(s.is_fork_spawn("a", None, Some("task_9")).unwrap());
+        assert!(!s.is_fork_spawn("b", Some("toolu_1"), None).unwrap());
+        assert!(!s.fork_completed_since("a", "journal", 0).unwrap());
+        assert!(s
+            .mark_spawn_terminal("a", None, Some("task_9"), "completed", 140)
+            .unwrap());
+        assert!(s.fork_completed_since("a", "journal", 110).unwrap());
+        // Completions only count from `since` on.
+        assert!(!s.fork_completed_since("a", "journal", 141).unwrap());
+        // A repeat notification (same task-id) stays matched, keeps first stamp.
+        assert!(s
+            .mark_spawn_terminal("a", Some("toolu_1"), None, "stopped", 150)
+            .unwrap());
+        assert!(!s.fork_completed_since("a", "journal", 141).unwrap());
+        assert!(s.fork_completed_since("a", "journal", 140).unwrap());
+    }
+
+    #[test]
+    fn pending_deps_lifecycle() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        s.insert_pending_dep(
+            "a",
+            "beta",
+            Path::new("/p/beta.md"),
+            "idle",
+            false,
+            &["alpha".to_string()],
+            110,
+        )
+        .unwrap();
+        s.insert_pending_dep(
+            "a",
+            "gamma",
+            Path::new("/p/gamma.md"),
+            "idle",
+            true,
+            &["alpha".to_string(), "beta".to_string()],
+            111,
+        )
+        .unwrap();
+        let deps = s.list_pending_deps("a").unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].fork_name, "beta");
+        assert!(!deps[0].overlap);
+        assert_eq!(deps[0].preds, vec!["alpha".to_string()]);
+        assert_eq!(deps[1].preds.len(), 2);
+
+        s.delete_pending_dep("a", "beta").unwrap();
+        assert_eq!(s.list_pending_deps("a").unwrap().len(), 1);
+        assert_eq!(s.clear_pending_deps("a").unwrap(), 1);
+        assert!(s.list_pending_deps("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_session_clears_spawns_and_pending() {
+        let s = store();
+        seed_session(&s, "a", "/p", 100);
+        s.record_spawn("a", "toolu_1", Some("j"), 110).unwrap();
+        s.insert_pending_dep(
+            "a",
+            "b",
+            Path::new("/p/b.md"),
+            "idle",
+            false,
+            &["j".to_string()],
+            110,
+        )
+        .unwrap();
+        s.close_session("a").unwrap();
+        assert!(!s.is_fork_spawn("a", Some("toolu_1"), None).unwrap());
+        assert!(s.list_pending_deps("a").unwrap().is_empty());
     }
 
     #[test]

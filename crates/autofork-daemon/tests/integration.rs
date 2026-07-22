@@ -22,6 +22,7 @@ struct Harness {
     project: PathBuf,
     daemon: Option<Child>,
     poll_grace_ms: Option<u64>,
+    wake_grace_secs: Option<u64>,
 }
 
 impl Harness {
@@ -46,11 +47,17 @@ impl Harness {
             project,
             daemon: None,
             poll_grace_ms: None,
+            wake_grace_secs: None,
         }
     }
 
     fn poll_grace_ms(mut self, ms: u64) -> Self {
         self.poll_grace_ms = Some(ms);
+        self
+    }
+
+    fn wake_grace_secs(mut self, secs: u64) -> Self {
+        self.wake_grace_secs = Some(secs);
         self
     }
 
@@ -97,6 +104,9 @@ impl Harness {
         if let Some(ms) = self.poll_grace_ms {
             cmd.env("AUTOFORK_POLL_LOSS_GRACE_MS", ms.to_string());
         }
+        if let Some(secs) = self.wake_grace_secs {
+            cmd.env("AUTOFORK_WAKE_GRACE_SECS", secs.to_string());
+        }
         let child = cmd.spawn().unwrap();
         self.daemon = Some(child);
         let start = Instant::now();
@@ -131,6 +141,9 @@ impl Harness {
             enable_tags: None,
             disable_tags: None,
             waking: None,
+            notif_tool_use_id: None,
+            notif_task_id: None,
+            notif_status: None,
         }
     }
 
@@ -139,6 +152,69 @@ impl Harness {
         let mut ev = self.event(EventKind::PromptSubmit, session);
         ev.waking = Some(waking);
         ev
+    }
+
+    /// A PromptSubmit carrying a task-notification envelope, as the CLI sends
+    /// for `<task-notification>` prompts (coarse `waking: false` plus the ids
+    /// the daemon classifies against its spawn registry).
+    fn prompt_submit_notif(&self, session: &str, tool_use_id: &str, status: &str) -> Event {
+        let mut ev = self.event(EventKind::PromptSubmit, session);
+        ev.waking = Some(false);
+        ev.notif_tool_use_id = Some(tool_use_id.to_string());
+        ev.notif_status = Some(status.to_string());
+        ev
+    }
+
+    /// An event pointing at the project transcript (needed whenever the test
+    /// exercises transcript ingestion: spawns, completions, the gauge).
+    fn event_t(&self, kind: EventKind, session: &str) -> Event {
+        let mut ev = self.event(kind, session);
+        ev.transcript_path = Some(self.project.join("transcript.jsonl"));
+        ev
+    }
+
+    /// Append a raw JSONL line to the transcript.
+    fn append_transcript_line(&self, line: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.project.join("transcript.jsonl"))
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// Append a fork-spawn Agent tool_use (with the spawn-prompt fingerprint)
+    /// to the transcript, as the wake turn would produce.
+    fn append_fork_spawn(&self, tool_use_id: &str, fork: &str) {
+        let prompt = format!(
+            "Read the file /x/{fork}.md and follow the instructions in its body. \
+             Context for this run: fork '{fork}', trigger 'idle', parent session s, \
+             conversation c, project root /p."
+        );
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": tool_use_id, "name": "Agent",
+                  "input": { "subagent_type": "fork", "prompt": prompt } },
+            ] }
+        });
+        self.append_transcript_line(&line.to_string());
+    }
+
+    /// Append a background-task completion notification to the transcript, as
+    /// the relay turn's user entry would contain.
+    fn append_completion_notification(&self, tool_use_id: &str, status: &str) {
+        let content = format!(
+            "<task-notification>\n<task-id>t-{tool_use_id}</task-id>\n\
+             <tool-use-id>{tool_use_id}</tool-use-id>\n<status>{status}</status>\n\
+             <summary>Agent \"x\" finished</summary>\n<result>report</result>"
+        );
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": content }
+        });
+        self.append_transcript_line(&line.to_string());
     }
 
     /// One-shot request/response over a fresh connection.
@@ -455,7 +531,7 @@ fn tag_throttle_suppresses_group_but_other_tag_wakes() {
 }
 
 #[test]
-fn after_chain_phrased_as_dependency() {
+fn after_dependent_held_until_predecessor_completes() {
     let mut h = Harness::new("1s", "0");
     h.write_fork("alpha.md", "---\nfork: true\nrun_on: [idle]\n---\nALPHA");
     h.write_fork(
@@ -463,19 +539,117 @@ fn after_chain_phrased_as_dependency() {
         "---\nfork: true\nrun_on: [idle]\nafter: alpha\n---\nBETA",
     );
     h.start_daemon();
-    assert_ack(h.send_event(h.event(EventKind::SessionStart, "s1")));
-    let rx = h.park_stop_wait(h.event(EventKind::Stop, "s1"));
-    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
 
-    // alpha spawns now; beta is deferred until alpha's completion.
-    let alpha_pos = payload.find("due: alpha").unwrap();
-    let beta_defer = payload.find("Do not spawn fork 'beta' yet").unwrap();
+    // Wake 1: alpha spawns now; beta is held by the daemon, not the model.
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: alpha"), "{payload}");
+    assert!(payload.contains("held back by autofork"), "{payload}");
+    assert!(payload.contains("'beta' (after 'alpha')"), "{payload}");
+    assert!(!payload.contains("due: beta"), "{payload}");
+
+    // The wake turn spawns alpha; its Stop parks a new poll (which ingests
+    // the spawn from the transcript) and stays parked — nothing else is due.
+    h.append_fork_spawn("toolu_alpha", "alpha");
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(400));
+
+    // alpha finishes: its completion notification lands in the transcript and
+    // the relay turn's continuation cancels the parked poll.
+    h.append_completion_notification("toolu_alpha", "completed");
+    assert_ack(h.send_event(h.prompt_submit("s1", false)));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // The relay turn's own Stop is answered immediately with beta's release.
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let release = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(
-        alpha_pos < beta_defer,
-        "root must precede dependent: {payload}"
+        release.contains("due: beta (trigger: idle) — released, 'alpha' finished"),
+        "{release}"
     );
-    assert!(payload.contains("After 'alpha' finish"));
-    assert!(payload.contains("include the report(s) they returned"));
+    assert!(release.contains("Read the file"), "{release}");
+    assert!(release.contains("beta.md"), "{release}");
+    assert!(
+        release.contains("append the report(s) 'alpha' returned"),
+        "{release}"
+    );
+
+    // The release is one-shot: the release turn's Stop parks quietly.
+    let rx4 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx4.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "release fired twice"
+    );
+}
+
+#[test]
+fn foreign_task_completion_starts_a_new_pause() {
+    // A background task the daemon didn't spawn finishes → the session picks
+    // real work back up → the next pause must re-fire idle forks (this was the
+    // "handover never fires again after a background job" bug).
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // Wake turn's Stop re-parks; the fork is latched for this pause.
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(400));
+
+    // A completion notification for a task that is NOT one of our spawns.
+    assert_ack(h.send_event(h.prompt_submit_notif("s1", "toolu_users_build", "completed")));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // New pause: the idle fork fires again.
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    let payload = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert!(payload.contains("due: journal"), "{payload}");
+}
+
+#[test]
+fn own_fork_completion_does_not_restart_the_pause() {
+    // The counterpart guard: a completion notification for a fork the daemon
+    // itself spawned stays a continuation of the same pause — even with the
+    // post-wake grace window disabled — so wakes can never feed back.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // The wake turn spawns the fork; the next poll ingests the spawn.
+    h.append_fork_spawn("toolu_j", "journal");
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    std::thread::sleep(Duration::from_millis(400));
+
+    // The fork's own completion notification arrives.
+    assert_ack(h.send_event(h.prompt_submit_notif("s1", "toolu_j", "completed")));
+    assert!(matches!(
+        rx2.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ResponseBody::Waited
+    ));
+
+    // Same pause: the relay turn's Stop parks quietly, no re-fire.
+    let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx3.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "own fork completion re-fired the idle fork"
+    );
 }
 
 #[test]
