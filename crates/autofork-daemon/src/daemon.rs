@@ -273,6 +273,16 @@ impl Daemon {
                 // the spawn registry can't vouch for either way (e.g. a fork
                 // that completed before its spawn's Stop was ever ingested).
                 let waking = if ev.notif_tool_use_id.is_some() || ev.notif_task_id.is_some() {
+                    // Refresh the spawn registry from the transcript BEFORE
+                    // classifying: the spawn's tool_use is always on disk by
+                    // the time its completion notification is delivered, but
+                    // the last Stop's ingest may predate it (observed live: a
+                    // Stop racing the transcript flush — or no Stop-wait read
+                    // at all between spawn and completion — left the registry
+                    // empty, misclassified the fork's own completion as
+                    // foreign activity, and re-fired the idle fork forever
+                    // after, once per fork run).
+                    self.ingest_transcript(&ev);
                     let store = self.store.lock().unwrap();
                     let status = ev.notif_status.as_deref().unwrap_or("");
                     let matched = if autofork_core::notification::is_terminal_status(status) {

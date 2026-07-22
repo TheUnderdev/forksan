@@ -156,9 +156,11 @@ impl Harness {
 
     /// A PromptSubmit carrying a task-notification envelope, as the CLI sends
     /// for `<task-notification>` prompts (coarse `waking: false` plus the ids
-    /// the daemon classifies against its spawn registry).
+    /// the daemon classifies against its spawn registry). Carries the
+    /// transcript path, as the real hook does — classification ingests the
+    /// transcript delta first.
     fn prompt_submit_notif(&self, session: &str, tool_use_id: &str, status: &str) -> Event {
-        let mut ev = self.event(EventKind::PromptSubmit, session);
+        let mut ev = self.event_t(EventKind::PromptSubmit, session);
         ev.waking = Some(false);
         ev.notif_tool_use_id = Some(tool_use_id.to_string());
         ev.notif_status = Some(status.to_string());
@@ -616,6 +618,36 @@ fn foreign_task_completion_starts_a_new_pause() {
     let rx3 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
     let payload = wake_payload(rx3.recv_timeout(Duration::from_secs(10)).unwrap());
     assert!(payload.contains("due: journal"), "{payload}");
+}
+
+#[test]
+fn own_fork_completion_matches_even_without_an_intervening_stop() {
+    // Observed live (v0.8.0): the spawn's tool_use was on disk but no
+    // stop-wait had ingested it when the completion notification arrived, so
+    // the registry was empty, the fork's own completion classified as foreign
+    // activity, and the idle fork re-fired every pause — once per fork run,
+    // forever. Classification must refresh the registry from the transcript
+    // before deciding.
+    let mut h = Harness::new("1s", "0").wake_grace_secs(0);
+    h.write_fork("journal.md", "---\nfork: true\nrun_on: [idle]\n---\nJ");
+    h.start_daemon();
+    h.write_transcript(100);
+    assert_ack(h.send_event(h.event_t(EventKind::SessionStart, "s1")));
+
+    let rx = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    wake_payload(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+
+    // The spawn lands in the transcript, but NO Stop poll reads it before the
+    // fork's completion notification arrives.
+    h.append_fork_spawn("toolu_j", "journal");
+    assert_ack(h.send_event(h.prompt_submit_notif("s1", "toolu_j", "completed")));
+
+    // Same pause: the relay turn's Stop parks quietly, no re-fire.
+    let rx2 = h.park_stop_wait(h.event_t(EventKind::Stop, "s1"));
+    assert!(
+        rx2.recv_timeout(Duration::from_millis(2500)).is_err(),
+        "own fork completion re-fired the idle fork without an intervening Stop"
+    );
 }
 
 #[test]
